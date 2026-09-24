@@ -93,6 +93,8 @@ function inferEventType(topics: unknown[]): EventType {
   if (tag === "stream_set") return "stream_set";
   if (tag === "given") return "given";
   if (tag === "collected") return "collected";
+  if (tag === "strm_recv" || tag === "stream_received") return "stream_received";
+  if (tag === "squeezed" || tag === "squeeze") return "squeezed";
   return "unknown";
 }
 
@@ -377,6 +379,26 @@ async function poll(): Promise<void> {
                 : value != null
                   ? String(value)
                   : null;
+            break;
+          case "stream_received":
+            // topics: ["strm_recv", account, token]
+            // value: [cycles_processed, amount_received]
+            beneficiary = toStr(topics[1]);
+            token = toStr(topics[2]);
+            amount =
+              valueArr[1] != null
+                ? String(valueArr[1])
+                : valueArr[0] != null
+                  ? String(valueArr[0])
+                  : null;
+            break;
+          case "squeezed":
+            // topics: ["squeezed", receiver, sender, token]
+            // value: [amount_stroops, cycle_id, history_hash]
+            beneficiary = toStr(topics[1]);
+            grantor = toStr(topics[2]);
+            token = toStr(topics[3]);
+            amount = valueArr[0] != null ? String(valueArr[0]) : null;
             break;
         }
 

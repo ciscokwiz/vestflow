@@ -3679,6 +3679,33 @@ impl VestFlowContract {
         }
     }
 
+    /// Transfer one-time token gifts to multiple receivers atomically.
+    pub fn batch_give(
+        env: Env,
+        sender: Address,
+        receivers: Vec<Address>,
+        amounts: Vec<i128>,
+        token: Address,
+    ) {
+        sender.require_auth();
+        assert!(receivers.len() == amounts.len(), "Receivers and amounts length mismatch");
+        assert!(!receivers.is_empty(), "Receivers must not be empty");
+
+        let token_client = token::Client::new(&env, &token);
+        for i in 0..receivers.len() {
+            let receiver = receivers.get(i).unwrap();
+            let amount = amounts.get(i).unwrap();
+            assert!(amount > 0, "Give amount must be positive");
+            token_client.transfer(&sender, &receiver, &amount);
+        }
+        for i in 0..receivers.len() {
+            env.events().publish(
+                (symbol_short!("given"), sender.clone(), token.clone()),
+                amounts.get(i).unwrap(),
+            );
+        }
+    }
+
     /// Stream funds to all members of a drips list equally.
     ///
     /// Calculates `amt_per_sec = total_amt_per_sec / member_count` and opens streams
@@ -8752,6 +8779,37 @@ mod test {
         let stream2 = client.get_drips_stream(&list_id, &member2).unwrap();
         assert_eq!(stream1_updated.amt_per_sec, 500);
         assert_eq!(stream2.amt_per_sec, 500);
+    }
+
+    #[test]
+    fn test_batch_give_transfers_to_50_receivers_and_emits_events() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let (client, sender, _, token_address, _) = setup(&env);
+        let token = TokenClient::new(&env, &token_address);
+        let amount = 25i128;
+        let mut receivers = Vec::new(&env);
+        let mut amounts = Vec::new(&env);
+        for _ in 0..50 {
+            receivers.push_back(Address::generate(&env));
+            amounts.push_back(amount);
+        }
+
+        let sender_before = token.balance(&sender);
+        client.batch_give(&sender, &receivers, &amounts, &token_address);
+
+        let events = env.events().all();
+        let given_events = events.iter().filter(|(_, topics, data)| {
+            let event: soroban_sdk::Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+            let event_data: i128 = data.try_into_val(&env).unwrap();
+            event == symbol_short!("given") && event_data == amount
+        });
+        assert_eq!(given_events.count(), 50);
+
+        assert_eq!(token.balance(&sender), sender_before - amount * 50);
+        for receiver in receivers.iter() {
+            assert_eq!(token.balance(&receiver), amount);
+        }
     }
 
     #[test]

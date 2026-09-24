@@ -11,7 +11,47 @@ export type EventType =
   | "stream_set"
   | "given"
   | "collected"
+  | "stream_received"
+  | "squeezed"
   | "unknown";
+
+export interface StreamCycleRow {
+  account: string;
+  token: string;
+  cycle_end_ledger: number;
+  cycle_end_timestamp: number;
+  amount_received: string;
+  created_at?: number;
+}
+
+export interface SqueezeEventRow {
+  id: string;
+  receiver: string;
+  sender: string;
+  token: string;
+  amount_stroops: string;
+  cycle_id: number;
+  ledger: number;
+  timestamp: number;
+  history_hash?: string | null;
+  is_duplicate: number;
+}
+
+export interface StreamConfigDetails {
+  sender: string;
+  receiver: string;
+  token: string;
+  rate: string;
+  start_time: number;
+  balance: string;
+  max_end_time: number | null;
+}
+
+export interface TopReceiverRow {
+  account: string;
+  total_incoming_rate_per_sec: string;
+  sender_count: number;
+}
 
 /** A single indexed contract event row. */
 export interface IndexedEvent {

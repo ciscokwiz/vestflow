@@ -435,6 +435,22 @@ export async function addToDripsList(
   ]);
 }
 
+export async function fundDripsList(
+  publicKey: string,
+  listId: number,
+  tokenAddress: string,
+  totalAmountPerSec: bigint,
+  balanceTopUp: bigint,
+): Promise<string> {
+  return buildAndSend(publicKey, "fund_drips_list", [
+    nativeToScVal(publicKey, { type: "address" }),
+    nativeToScVal(listId, { type: "u64" }),
+    nativeToScVal(tokenAddress, { type: "address" }),
+    nativeToScVal(totalAmountPerSec, { type: "i128" }),
+    nativeToScVal(balanceTopUp, { type: "i128" }),
+  ]);
+}
+
 export async function removeFromDripsList(
   publicKey: string,
   listId: number,

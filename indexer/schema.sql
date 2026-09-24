@@ -16,6 +16,8 @@ CREATE TABLE IF NOT EXISTS schedule_events (
     'stream_set',
     'given',
     'collected',
+    'stream_received',
+    'squeezed',
     'unknown'
   )),
 
@@ -206,6 +208,38 @@ CREATE TABLE IF NOT EXISTS collected_totals (
   updated_at               INTEGER NOT NULL,
   PRIMARY KEY (account, token)
 );
+
+-- Stream cycles table for /analytics/cycles
+CREATE TABLE IF NOT EXISTS stream_cycles (
+  account             TEXT NOT NULL,
+  token               TEXT NOT NULL,
+  cycle_end_ledger    INTEGER NOT NULL,
+  cycle_end_timestamp INTEGER NOT NULL,
+  amount_received     TEXT NOT NULL,
+  created_at          INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (account, token, cycle_end_ledger)
+);
+
+CREATE INDEX IF NOT EXISTS idx_stream_cycles_account_token
+  ON stream_cycles (account, token, cycle_end_ledger DESC);
+
+-- Squeeze events table with duplicate detection
+CREATE TABLE IF NOT EXISTS squeeze_events (
+  id             TEXT PRIMARY KEY,
+  receiver       TEXT NOT NULL,
+  sender         TEXT NOT NULL,
+  token          TEXT NOT NULL,
+  amount_stroops TEXT NOT NULL,
+  cycle_id       INTEGER NOT NULL,
+  ledger         INTEGER NOT NULL,
+  timestamp      INTEGER NOT NULL,
+  history_hash   TEXT,
+  is_duplicate   INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_squeeze_events_receiver_sender_history
+  ON squeeze_events (receiver, sender, history_hash);
+
 
 -- Notification subscriptions
 CREATE TABLE IF NOT EXISTS notification_subscriptions (

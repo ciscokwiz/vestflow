@@ -12,6 +12,7 @@ import {
   Transaction,
   TransactionBuilder,
   nativeToScVal,
+  scValToNative,
   xdr,
 } from "@stellar/stellar-sdk";
 
@@ -183,9 +184,19 @@ export interface MockRpcOptions {
   ledgerTime?: number;
 }
 
+export interface MockDripsList {
+  id: string;
+  name: string;
+  owner: string;
+  token: string;
+  members: string[];
+  rate: bigint;
+}
+
 export interface MockRpc {
   /** Moves the mocked ledger clock forward so the stream accrues `seconds` more. */
   advanceLedgerTime(seconds: number): void;
+  lists: MockDripsList[];
 }
 
 /**
@@ -207,6 +218,7 @@ export async function mockFreighterAndRpc(
 ): Promise<MockRpc> {
   let ledgerTime = options.ledgerTime ?? Math.floor(Date.now() / 1000);
   let collected = 0n;
+  const lists: MockDripsList[] = [];
 
   await page.addInitScript(
     ({ publicKey }) => {
@@ -258,10 +270,32 @@ export async function mockFreighterAndRpc(
       case "simulateTransaction": {
         seq++;
         lastFunctionName = params?.transaction ? invokedFunctionName(params.transaction) : "";
+        let listStreamRetval: xdr.ScVal | null = null;
+        if (params?.transaction && lastFunctionName === "get_drips_stream") {
+          try {
+            const tx = TransactionBuilder.fromXDR(params.transaction, Networks.TESTNET) as Transaction;
+            const invoke = (tx.operations[0] as unknown as { func: xdr.HostFunction }).func.invokeContract();
+            const args = invoke.args().map((arg) => scValToNative(arg)) as unknown[];
+            const list = lists.find((item) => item.id === String(args[0]));
+            const member = String(args[1]);
+            if (list && list.rate > 0n && list.members.includes(member)) {
+              listStreamRetval = nativeToScVal({
+                funder: list.owner,
+                list_id: BigInt(list.id),
+                member,
+                token: list.token,
+                amt_per_sec: list.rate / BigInt(list.members.length),
+                start_time: 1_700_000_000n,
+              });
+            }
+          } catch {
+            listStreamRetval = null;
+          }
+        }
         const streamRetval = options.stream
           ? streamRetvalFor(lastFunctionName, options.stream, ledgerTime, collected)
           : null;
-        const retval = streamRetval ?? retvalFor(lastFunctionName, seq);
+        const retval = listStreamRetval ?? streamRetval ?? retvalFor(lastFunctionName, seq);
         return respond({
           latestLedger: 1000,
           minResourceFee: "50000",
@@ -272,6 +306,22 @@ export async function mockFreighterAndRpc(
         });
       }
       case "sendTransaction": {
+        if (params?.transaction) {
+          try {
+            const tx = TransactionBuilder.fromXDR(params.transaction, Networks.TESTNET) as Transaction;
+            const op = tx.operations[0] as unknown as { func: xdr.HostFunction };
+            const invoke = op.func.invokeContract();
+          } catch {
+            // The mock accepts signed envelopes without requiring a real signer.
+          }
+        }
+        if (lists.length === 0) {
+          lists.push({ id: "1", name: "Core Contributors", owner: MOCK_PUBLIC_KEY, token: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC", members: [], rate: 0n });
+        } else if (lists[0].rate === 0n && lists[0].members.length < 3) {
+          lists[0].members.push(`member-${lists[0].members.length + 1}`);
+        } else if (lists[0].rate === 0n) {
+          lists[0].rate = 1000n;
+        }
         if (
           options.stream &&
           params?.transaction &&
@@ -311,5 +361,6 @@ export async function mockFreighterAndRpc(
     advanceLedgerTime(seconds: number) {
       ledgerTime += seconds;
     },
+    lists,
   };
 }

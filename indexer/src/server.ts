@@ -29,6 +29,9 @@ import {
   queryGives,
   queryGivesForAccount,
   queryHistory,
+  queryStreamConfig,
+  queryStreamCycles,
+  queryTopReceivers,
 } from "./db";
 import type { EventQueryParams, GiveQueryParams } from "./types";
 import { routeWebhookRequest } from "./webhook-api";
@@ -128,7 +131,7 @@ function networkParam(params: URLSearchParams): "mainnet" | "testnet" | null {
   return network === "mainnet" || network === "testnet" ? network : null;
 }
 
-const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
+const STELLAR_ADDRESS = /^G[A-Z2-7]{54,55}$/;
 
 function handleLists(
   res: http.ServerResponse,
@@ -547,6 +550,81 @@ function handleProfile(
   }
 }
 
+function handleStreamConfig(
+  res: http.ServerResponse,
+  sender: string,
+  receiver: string,
+  token: string,
+  searchParams: URLSearchParams,
+): void {
+  if (!STELLAR_ADDRESS.test(sender) || !STELLAR_ADDRESS.test(receiver)) {
+    return json(res, 400, { error: "Invalid Stellar address" });
+  }
+
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  const config = queryStreamConfig(sender, receiver, token, network);
+  if (!config) {
+    return json(res, 404, { error: "Stream not found" });
+  }
+
+  return json(res, 200, config);
+}
+
+function handleAnalyticsCycles(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  const account = searchParams.get("account") ?? undefined;
+  const token = searchParams.get("token") ?? undefined;
+  const limit = numParam(searchParams, "limit");
+
+  const cycles = queryStreamCycles({ account, token, limit, network });
+  return json(res, 200, { cycles });
+}
+
+function handleAnalyticsTopReceivers(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
+  const token = searchParams.get("token");
+  if (!token) {
+    return json(res, 400, { error: "token query param is required" });
+  }
+
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  const rawLimit = searchParams.get("limit");
+  let limit = 10;
+  if (rawLimit != null) {
+    const parsed = Number(rawLimit);
+    if (!Number.isInteger(parsed) || parsed < 1 || parsed > 50) {
+      return json(res, 400, { error: "limit must be an integer between 1 and 50" });
+    }
+    limit = parsed;
+  }
+
+  const key = cacheKey(`top-receivers:${network}:${token}`, String(limit), "current", false);
+  const cached = cacheGet<ReturnType<typeof queryTopReceivers>>(key);
+  const receivers = cached ?? queryTopReceivers(token, limit, network);
+  if (!cached) {
+    cacheSet(key, receivers, "current");
+  }
+
+  return json(res, 200, { receivers, cached: !!cached });
+}
+
 export function createServer(): http.Server {
   return http.createServer(async (req, res) => {
     let url: URL;
@@ -610,6 +688,9 @@ export function createServer(): http.Server {
     );
     const listMembersMatch = url.pathname.match(/^\/lists\/([^/]+)\/members$/);
     const profileMatch = url.pathname.match(/^\/profile\/(G[A-Z2-7]{55})$/);
+    const streamConfigMatch = url.pathname.match(
+      /^\/streams\/([^/]+)\/([^/]+)\/([^/]+)$/,
+    );
 
     switch (url.pathname) {
       case "/health":
@@ -623,6 +704,12 @@ export function createServer(): http.Server {
 
       case "/analytics/tvl":
         return handleAnalyticsTvl(res, url.searchParams);
+
+      case "/analytics/cycles":
+        return handleAnalyticsCycles(res, url.searchParams);
+
+      case "/analytics/top-receivers":
+        return handleAnalyticsTopReceivers(res, url.searchParams);
 
       case "/gives":
         return handleGives(res, url.searchParams);
@@ -639,6 +726,15 @@ export function createServer(): http.Server {
         return handleSplits(res, url.searchParams, req.headers["if-none-match"]);
 
       default:
+        if (streamConfigMatch) {
+          return handleStreamConfig(
+            res,
+            decodeURIComponent(streamConfigMatch[1]),
+            decodeURIComponent(streamConfigMatch[2]),
+            decodeURIComponent(streamConfigMatch[3]),
+            url.searchParams,
+          );
+        }
         if (historyMatch) {
           return handleHistory(res, historyMatch[1], url.searchParams);
         }

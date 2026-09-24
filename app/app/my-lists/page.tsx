@@ -11,6 +11,7 @@ import {
   connectWallet,
   createDripsList,
   DripsStreamData,
+  fundDripsList,
   getDripsStream,
   removeFromDripsList,
   stroopsToXlm,
@@ -36,6 +37,7 @@ export default function MyListsPage() {
   const [loading, setLoading] = useState(true);
   const [listName, setListName] = useState("");
   const [memberInputs, setMemberInputs] = useState<Record<string, string>>({});
+  const [fundInputs, setFundInputs] = useState<Record<string, { rate: string; topUp: string }>>({});
   const [busy, setBusy] = useState<string | null>(null);
 
   const loadLists = async () => {
@@ -147,6 +149,24 @@ export default function MyListsPage() {
     }
   };
 
+  const handleFund = async (list: ManagedList) => {
+    if (!publicKey) return;
+    const values = fundInputs[list.id] || { rate: "", topUp: "" };
+    const rate = BigInt(values.rate || "0");
+    const topUp = BigInt(values.topUp || "0");
+    if (rate <= 0n || topUp < 0n) return;
+    setBusy(`fund:${list.id}`);
+    try {
+      await fundDripsList(publicKey, Number(list.id), list.token, rate, topUp);
+      addToast({ status: "success", title: "List funded", message: "Funding was added on-chain." });
+      await loadLists();
+    } catch (error) {
+      addToast({ status: "error", title: "Funding failed", message: error instanceof Error ? error.message : "Could not fund list" });
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <>
       <Navbar />
@@ -203,6 +223,28 @@ export default function MyListsPage() {
                   />
                   <button type="submit" disabled={busy === `add:${list.id}`} className="rounded-lg border border-violet-500/40 px-4 py-2 text-sm text-violet-300 hover:border-violet-400 disabled:opacity-50">
                     {busy === `add:${list.id}` ? "Adding..." : "Add member"}
+                  </button>
+                </form>
+
+                <form onSubmit={event => { event.preventDefault(); handleFund(list); }} className="flex flex-col sm:flex-row gap-2">
+                  <input
+                    value={fundInputs[list.id]?.rate || ""}
+                    onChange={event => setFundInputs(current => ({ ...current, [list.id]: { ...(current[list.id] || { topUp: "" }), rate: event.target.value } }))}
+                    placeholder="Total rate (stroops/s)"
+                    aria-label={`Fund rate for ${list.name}`}
+                    inputMode="numeric"
+                    className="input flex-1"
+                  />
+                  <input
+                    value={fundInputs[list.id]?.topUp || ""}
+                    onChange={event => setFundInputs(current => ({ ...current, [list.id]: { ...(current[list.id] || { rate: "" }), topUp: event.target.value } }))}
+                    placeholder="Top-up amount"
+                    aria-label={`Fund amount for ${list.name}`}
+                    inputMode="numeric"
+                    className="input flex-1"
+                  />
+                  <button type="submit" disabled={busy === `fund:${list.id}`} className="rounded-lg border border-emerald-500/40 px-4 py-2 text-sm text-emerald-300 disabled:opacity-50">
+                    {busy === `fund:${list.id}` ? "Funding..." : "Fund list"}
                   </button>
                 </form>
 
