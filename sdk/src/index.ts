@@ -17,7 +17,7 @@ export {
   formatRate,
 } from "./utils";
 export type { ScheduleSummary } from "./utils";
-export { isScheduleRevoked } from "./types";
+export { isScheduleRevoked, TOTAL_SPLITS_WEIGHT } from "./types";
 export type {
   ScheduleData,
   RevokedSchedule,

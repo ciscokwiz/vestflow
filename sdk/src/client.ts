@@ -32,7 +32,9 @@ import type {
   TransactionResult,
   BalanceResult,
   SplitsConfig,
+  SplitsReceiver,
 } from "./types";
+import { TOTAL_SPLITS_WEIGHT } from "./types";
 import { xlmToStroops } from "./utils";
 import {
   waitForTransaction as waitForTransactionHelper,
@@ -1357,6 +1359,69 @@ export class VestflowClient {
       nativeToScVal(amount, { type: "i128" }),
     ];
     return this.submitAndSettle(sender, "give", args, signer);
+  }
+
+  /**
+   * Configure how incoming funds are split across receivers by wrapping the
+   * contract's `set_splits` entrypoint.
+   *
+   * Each receiver's `weightBps` is its share of incoming funds in basis
+   * points; the weights must sum to exactly {@link TOTAL_SPLITS_WEIGHT}
+   * (10 000 bps = 100%) or the call is rejected before any transaction is
+   * built.
+   *
+   * @param account - Stellar public key whose splits are being set (must sign the transaction).
+   * @param receivers - Typed receiver list; weights must sum to TOTAL_SPLITS_WEIGHT.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns Transaction result with hash and settlement status.
+   * @throws If any receiver address is not a valid Stellar address, any
+   *   `weightBps` is not a non-negative integer, or the weights do not sum to
+   *   TOTAL_SPLITS_WEIGHT.
+   */
+  async setSplits(
+    account: string,
+    receivers: SplitsReceiver[],
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<TransactionResult> {
+    for (const receiver of receivers) {
+      if (
+        !StrKey.isValidEd25519PublicKey(receiver.address) &&
+        !StrKey.isValidContract(receiver.address)
+      ) {
+        throw new Error("receiver must be a valid Stellar address");
+      }
+      if (!Number.isInteger(receiver.weightBps) || receiver.weightBps < 0) {
+        throw new Error("weightBps must be a non-negative integer");
+      }
+    }
+
+    const totalWeight = receivers.reduce((sum, r) => sum + r.weightBps, 0);
+    if (totalWeight !== TOTAL_SPLITS_WEIGHT) {
+      throw new Error(
+        `receiver weights must sum to TOTAL_SPLITS_WEIGHT (${TOTAL_SPLITS_WEIGHT}), got ${totalWeight}`
+      );
+    }
+
+    const receiversVal = xdr.ScVal.scvVec(
+      receivers.map((r) =>
+        xdr.ScVal.scvMap([
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("receiver"),
+            val: nativeToScVal(r.address, { type: "address" }),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("weight_bps"),
+            val: nativeToScVal(r.weightBps, { type: "u32" }),
+          }),
+        ])
+      )
+    );
+
+    const args: xdr.ScVal[] = [
+      nativeToScVal(account, { type: "address" }),
+      receiversVal,
+    ];
+    return this.submitAndSettle(account, "set_splits", args, signer);
   }
 
   subscribeToSchedule(

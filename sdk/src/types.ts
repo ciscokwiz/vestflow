@@ -161,6 +161,15 @@ export interface BalanceResult {
 }
 
 /**
+ * Total weight of a valid splits configuration, in basis points.
+ *
+ * A receiver list passed to {@link VestflowClient.setSplits} must have
+ * `weightBps` values that sum to exactly this value — the contract treats the
+ * configuration as a fixed 100% allocation across receivers.
+ */
+export const TOTAL_SPLITS_WEIGHT = 10_000;
+
+/**
  * A single receiver in a splits configuration.
  */
 export interface SplitsReceiver {

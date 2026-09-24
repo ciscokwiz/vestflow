@@ -150,6 +150,7 @@ try {
 | `claimVested(publicKey, id, signer)` | `Promise<string>` | Claim vested tokens |
 | `revokeSchedule(publicKey, id, signer)` | `Promise<string>` | Revoke a schedule (grantor only) |
 | `give(sender, receiver, token, amount, signer)` | `Promise<TransactionResult>` | Send a one-time direct payment, bypassing any schedule |
+| `setSplits(account, receivers, signer)` | `Promise<TransactionResult>` | Set the splits receivers; `weightBps` values must sum to `TOTAL_SPLITS_WEIGHT` (10 000) |
 
 ### Transaction polling
 
