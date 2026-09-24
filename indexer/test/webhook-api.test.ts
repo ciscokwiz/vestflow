@@ -61,12 +61,19 @@ interface Subscriber {
   secret: string;
   /** Status code returned by the handshake. */
   handshakeStatus: number;
+  /** Status code returned for every non-handshake request. */
+  eventStatus: number;
   received: { deliveryId: string | undefined; body: string }[];
 }
 
 /** A subscriber that echoes the handshake signature, like a real one would. */
 async function startSubscriber(secret: string): Promise<Subscriber> {
-  const state: Partial<Subscriber> = { secret, handshakeStatus: 200, received: [] };
+  const state: Partial<Subscriber> = {
+    secret,
+    handshakeStatus: 200,
+    eventStatus: 200,
+    received: [],
+  };
 
   const server = http.createServer((req, res) => {
     const chunks: Buffer[] = [];
@@ -92,7 +99,7 @@ async function startSubscriber(secret: string): Promise<Subscriber> {
         deliveryId: req.headers["x-vestflow-delivery-id"] as string | undefined,
         body,
       });
-      res.writeHead(200);
+      res.writeHead(state.eventStatus as number);
       res.end();
     });
   });
@@ -480,6 +487,98 @@ describe("registration lifecycle", () => {
       expect(unknown.status).toBe(404);
     } finally {
       await subscriber.close();
+    }
+  });
+});
+
+describe("POST /webhooks/test", () => {
+  async function registerVerified(token = mintToken(OWNER)) {
+    const secret = crypto.randomBytes(32).toString("hex");
+    const subscriber = await startSubscriber(secret);
+    const response = await api("/webhooks", {
+      method: "POST",
+      token,
+      body: { endpoint_url: subscriber.url, event_types: ["*"], secret },
+    });
+    return { subscriber, id: response.body.registration_id as string };
+  }
+
+  it("delivers a signed test event and reports the 2xx status", async () => {
+    const { subscriber, id } = await registerVerified();
+    try {
+      const response = await api("/webhooks/test", {
+        method: "POST",
+        body: { endpoint_url: subscriber.url },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ success: true, status: 200 });
+      expect(subscriber.received).toHaveLength(1);
+      expect(JSON.parse(subscriber.received[0].body)).toEqual({
+        type: "webhook.test",
+        registration_id: id,
+      });
+
+      // A test is not a queued delivery.
+      expect(store.listDeliveries({ registrationId: id })).toHaveLength(0);
+    } finally {
+      await subscriber.close();
+    }
+  });
+
+  it("reports the status and an error when the endpoint does not answer 2xx", async () => {
+    const { subscriber } = await registerVerified();
+    subscriber.eventStatus = 500;
+    try {
+      const response = await api("/webhooks/test", {
+        method: "POST",
+        body: { endpoint_url: subscriber.url },
+      });
+
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({
+        success: false,
+        status: 500,
+        error: "endpoint responded 500",
+      });
+    } finally {
+      await subscriber.close();
+    }
+  });
+
+  it("only targets URLs the caller has registered and verified", async () => {
+    const theirs = await registerVerified(mintToken(OTHER_OWNER));
+    const unverified = await startSubscriber("unused");
+    try {
+      const arbitrary = await api("/webhooks/test", {
+        method: "POST",
+        body: { endpoint_url: "http://127.0.0.1:1/not-registered" },
+      });
+      expect(arbitrary.status).toBe(404);
+
+      const otherOwners = await api("/webhooks/test", {
+        method: "POST",
+        body: { endpoint_url: theirs.subscriber.url },
+      });
+      expect(otherOwners.status).toBe(404);
+      expect(theirs.subscriber.received).toHaveLength(0);
+
+      await api("/webhooks", {
+        method: "POST",
+        body: { endpoint_url: unverified.url, event_types: ["*"] },
+      });
+      const notVerified = await api("/webhooks/test", {
+        method: "POST",
+        body: { endpoint_url: unverified.url },
+      });
+      expect(notVerified.status).toBe(409);
+      expect(unverified.received).toHaveLength(0);
+
+      const missing = await api("/webhooks/test", { method: "POST", body: {} });
+      expect(missing.status).toBe(400);
+    } finally {
+      await theirs.subscriber.close();
+      await unverified.close();
     }
   });
 });

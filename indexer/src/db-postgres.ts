@@ -31,6 +31,8 @@ export async function initializeSchema(): Promise<void> {
     "002_proposal_events.sql",
     "003_webhook_system.sql",
     "004_analytics_snapshots.sql",
+    "005_gives_token_indexes.sql",
+    "006_stream_hourly_snapshots.sql",
   ];
   const client = await getPool().connect();
   try {

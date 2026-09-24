@@ -15,14 +15,17 @@ export {
   parseContractError,
   formatSchedule,
   formatRate,
+  formatCycleDuration,
 } from "./utils";
 export type { ScheduleSummary } from "./utils";
-export { isScheduleRevoked, TOTAL_SPLITS_WEIGHT } from "./types";
+export { isScheduleRevoked, ProfileError } from "./types";
 export type {
   ScheduleData,
   RevokedSchedule,
   VestflowConfig,
   Stream,
+  StreamReceiver,
+  StreamsHistory,
   CreateScheduleParams,
   CreateGradedScheduleParams,
   ProposeScheduleParams,
@@ -32,10 +35,19 @@ export type {
   VestingKind,
   ClaimDelegation,
   CollectResult,
+  ReceiveStreamsResult,
+  SqueezeStreamsResult,
+  TopUpResult,
+  WithdrawResult,
   TransactionResult,
   BalanceResult,
   SplitsReceiver,
   SplitsConfig,
+  GiveRecord,
+  GiveHistoryPage,
+  GiveHistoryOptions,
+  DripsListSummary,
+  ProfileSummary,
 } from "./types";
 export { waitForTransaction, TimeoutError } from "./waitForTransaction";
 export type {

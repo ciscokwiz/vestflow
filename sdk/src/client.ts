@@ -28,13 +28,22 @@ import type {
   VestingKind,
   ClaimDelegation,
   Stream,
+  StreamsHistory,
   CollectResult,
+  ReceiveStreamsResult,
+  SqueezeStreamsResult,
+  TopUpResult,
+  WithdrawResult,
   TransactionResult,
   BalanceResult,
   SplitsConfig,
-  SplitsReceiver,
+  ProfileSummary,
+  GiveRecord,
+  GiveHistoryPage,
+  GiveHistoryOptions,
+  DripsListSummary,
 } from "./types";
-import { TOTAL_SPLITS_WEIGHT } from "./types";
+import { ProfileError } from "./types";
 import { xlmToStroops } from "./utils";
 import {
   waitForTransaction as waitForTransactionHelper,
@@ -101,6 +110,7 @@ export class VestflowClient {
   private readonly nativeToken: string;
   private readonly indexerUrl: string;
   private readonly networkPassphrase: string;
+  private readonly network: "testnet" | "mainnet";
   private readonly signTransaction: ((xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>) | null;
 
   /**
@@ -116,7 +126,7 @@ export class VestflowClient {
     this.nativeToken = config.nativeToken ?? defaults.nativeToken;
     this.indexerUrl = config.indexerUrl ?? defaults.indexerUrl;
     this.networkPassphrase = defaults.networkPassphrase;
-    this.indexerUrl = config.indexerUrl ?? defaults.indexerUrl;
+    this.network = net;
     this.server = new StellarRpc.Server(config.rpcUrl ?? defaults.rpcUrl);
     this.signTransaction = null;
   }
@@ -264,6 +274,50 @@ export class VestflowClient {
       ratePerSec: BigInt(String(item.ratePerSec ?? item.rate_per_sec ?? 0)),
       maxEndTime: Number(item.maxEndTime ?? item.max_end_time ?? 0),
     }));
+  }
+
+  /** Query sent and/or received give history for an account. */
+  async getGiveHistory(
+    account: string,
+    options: GiveHistoryOptions = {}
+  ): Promise<GiveHistoryPage> {
+    const asSender = options.asSender ?? false;
+    const asReceiver = options.asReceiver ?? false;
+    const directions = asSender === asReceiver
+      ? ["sender", "receiver"]
+      : [asSender ? "sender" : "receiver"];
+    const pages = await Promise.all(directions.map(async (direction) => {
+      const params = new URLSearchParams([[direction, account]]);
+      if (options.token) params.set("token", options.token);
+      if (options.limit !== undefined) params.set("limit", String(options.limit));
+      if (options.cursor) params.set("cursor", options.cursor);
+      const url = `${this.indexerUrl.replace(/\/$/, "")}/gives?${params}`;
+      const res = await fetch(url, { headers: { Accept: "application/json" } });
+      if (!res.ok) throw new Error(`Indexer request failed: ${res.status} ${res.statusText}`);
+      const data = (await res.json()) as {
+        gives?: unknown[];
+        items?: unknown[];
+        nextCursor?: string | null;
+        next_cursor?: string | null;
+      };
+      const raw = Array.isArray(data.gives) ? data.gives : data.items ?? [];
+      return {
+        items: (raw as Record<string, unknown>[]).map((item) => ({
+          id: String(item.id ?? ""),
+          sender: String(item.sender ?? ""),
+          receiver: String(item.receiver ?? ""),
+          token: String(item.token ?? ""),
+          amount: BigInt(String(item.amount ?? item.amount_stroops ?? 0)),
+          ledger: Number(item.ledger ?? 0),
+          timestamp: Number(item.timestamp ?? 0),
+        })),
+        nextCursor: data.nextCursor ?? data.next_cursor ?? undefined,
+      };
+    }));
+    return {
+      items: pages.flatMap((page) => page.items),
+      nextCursor: pages.find((page) => page.nextCursor)?.nextCursor,
+    };
   }
 
   // ── Internal: parse schedule ──────────────────────────────────────────────
@@ -714,6 +768,134 @@ export class VestflowClient {
         }))
       : [];
     return { receivers, hash: String(data.hash ?? "") };
+  }
+
+  /**
+   * Fetch an aggregated profile for a Stellar address from the indexer's
+   * `/profile/:address` endpoint.
+   *
+   * The profile combines the address's outgoing streams, splits
+   * configuration, give history and Drips lists, plus summary totals.
+   *
+   * Addresses with no activity resolve to a zeroed/empty profile rather
+   * than throwing.
+   *
+   * @param address - Stellar address (account) to look up.
+   * @returns Typed `ProfileSummary` for the address.
+   * @throws `ProfileError` with `status: 400` if `address` is not a valid
+   * Stellar ed25519 public key, or with the indexer's status on unexpected
+   * failures (404 resolves to an empty profile instead of throwing).
+   */
+  async getProfile(address: string): Promise<ProfileSummary> {
+    if (!StrKey.isValidEd25519PublicKey(address)) {
+      throw new ProfileError("address must be a valid Stellar public key", 400);
+    }
+
+    const url = new URL(`/profile/${address}`, this.indexerUrl);
+    url.searchParams.set("network", this.network);
+
+    const res = await fetch(url.toString());
+    if (res.status === 404) {
+      return this.emptyProfile(address);
+    }
+    if (!res.ok) {
+      throw new ProfileError(
+        `Failed to fetch profile for ${address}: ${res.status}`,
+        res.status
+      );
+    }
+
+    const data = await res.json();
+    return this.mapProfile(address, data);
+  }
+
+  /** Build an empty (zeroed) profile for an address with no activity. */
+  private emptyProfile(address: string): ProfileSummary {
+    return {
+      address,
+      network: this.network,
+      streams: [],
+      splits: { receivers: [], hash: "" },
+      gives: [],
+      dripsLists: [],
+      totals: {
+        streams: 0,
+        splitsReceivers: 0,
+        gives: 0,
+        totalGiven: 0n,
+        dripsLists: 0,
+      },
+    };
+  }
+
+  /** Normalise an indexer profile payload into a typed `ProfileSummary`. */
+  private mapProfile(address: string, data: any): ProfileSummary {
+    const streams: Stream[] = Array.isArray(data?.streams)
+      ? data.streams.map((s: any) => ({
+          sender: String(s.sender ?? address),
+          receiver: String(s.receiver ?? ""),
+          token: String(s.token ?? ""),
+          ratePerSec: BigInt(
+            s.ratePerSec ?? s.rate_per_sec ?? s.rate_per_second ?? 0
+          ),
+          maxEndTime: Number(
+            s.maxEndTime ?? s.max_end_time ?? s.estimated_end_time ?? 0
+          ),
+        }))
+      : [];
+
+    const splitsReceivers = Array.isArray(data?.splits?.receivers)
+      ? data.splits.receivers.map((r: any) => ({
+          address: String(r.address ?? r.account ?? r.receiver ?? ""),
+          weightBps: Number(r.weightBps ?? r.weight_bps ?? r.weight ?? 0),
+        }))
+      : [];
+
+    const gives: GiveRecord[] = Array.isArray(data?.gives)
+      ? data.gives.map((g: any) => ({
+          id: String(g.id ?? ""),
+          sender: String(g.sender ?? ""),
+          receiver: String(g.receiver ?? ""),
+          token: String(g.token ?? ""),
+          amount: BigInt(g.amount ?? g.amount_stroops ?? 0),
+          ledger: Number(g.ledger ?? 0),
+          timestamp: Number(g.timestamp ?? 0),
+        }))
+      : [];
+
+    const dripsLists: DripsListSummary[] = Array.isArray(data?.dripsLists)
+      ? data.dripsLists.map((d: any) => ({
+          id: String(d.id ?? ""),
+          name: String(d.name ?? ""),
+          owner: String(d.owner ?? ""),
+          token: String(d.token ?? ""),
+          memberCount: Number(d.memberCount ?? d.member_count ?? 0),
+        }))
+      : [];
+
+    const totalGiven = gives.reduce(
+      (acc, g) => acc + (g.sender === address ? g.amount : 0n),
+      0n
+    );
+
+    return {
+      address,
+      network: this.network,
+      streams,
+      splits: {
+        receivers: splitsReceivers,
+        hash: String(data?.splits?.hash ?? ""),
+      },
+      gives,
+      dripsLists,
+      totals: {
+        streams: streams.length,
+        splitsReceivers: splitsReceivers.length,
+        gives: gives.length,
+        totalGiven,
+        dripsLists: dripsLists.length,
+      },
+    };
   }
 
   /**
@@ -1362,56 +1544,173 @@ export class VestflowClient {
   }
 
   /**
-   * Configure how incoming funds are split across receivers by wrapping the
-   * contract's `set_splits` entrypoint.
+   * Send one-time direct payments ("gives") to multiple receivers in a
+   * single transaction, wrapping the contract's `batch_give` entry point.
    *
-   * Each receiver's `weightBps` is its share of incoming funds in basis
-   * points; the weights must sum to exactly {@link TOTAL_SPLITS_WEIGHT}
-   * (10 000 bps = 100%) or the call is rejected before any transaction is
-   * built.
-   *
-   * @param account - Stellar public key whose splits are being set (must sign the transaction).
-   * @param receivers - Typed receiver list; weights must sum to TOTAL_SPLITS_WEIGHT.
+   * @param sender - Sender's Stellar public key (must sign the transaction).
+   * @param receivers - Receiver Stellar addresses (accounts or contracts).
+   * @param amounts - Amount per receiver, in the token's base units. Must
+   * have the same length as `receivers`; every amount must be > 0n.
+   * @param token - Stellar Asset Contract address of the token to send.
    * @param signer - Function that signs the transaction XDR.
    * @returns Transaction result with hash and settlement status.
-   * @throws If any receiver address is not a valid Stellar address, any
-   *   `weightBps` is not a non-negative integer, or the weights do not sum to
-   *   TOTAL_SPLITS_WEIGHT.
+   * @throws If `receivers` and `amounts` lengths differ, any amount is not
+   * positive, or any address/token is not a valid Stellar address.
    */
-  async setSplits(
-    account: string,
-    receivers: SplitsReceiver[],
+  async batchGive(
+    sender: string,
+    receivers: string[],
+    amounts: bigint[],
+    token: string,
     signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
   ): Promise<TransactionResult> {
-    for (const receiver of receivers) {
+    if (receivers.length !== amounts.length) {
+      throw new Error("receivers and amounts must have the same length");
+    }
+    if (receivers.length === 0) {
+      throw new Error("receivers must not be empty");
+    }
+    for (const [i, amount] of amounts.entries()) {
+      if (amount <= 0n) {
+        throw new Error(`amounts[${i}] must be greater than 0`);
+      }
+    }
+    for (const [i, receiver] of receivers.entries()) {
       if (
-        !StrKey.isValidEd25519PublicKey(receiver.address) &&
-        !StrKey.isValidContract(receiver.address)
+        !StrKey.isValidEd25519PublicKey(receiver) &&
+        !StrKey.isValidContract(receiver)
       ) {
-        throw new Error("receiver must be a valid Stellar address");
-      }
-      if (!Number.isInteger(receiver.weightBps) || receiver.weightBps < 0) {
-        throw new Error("weightBps must be a non-negative integer");
+        throw new Error(`receivers[${i}] must be a valid Stellar address`);
       }
     }
+    if (!StrKey.isValidContract(token)) {
+      throw new Error("token must be a valid Stellar Asset Contract address");
+    }
 
-    const totalWeight = receivers.reduce((sum, r) => sum + r.weightBps, 0);
-    if (totalWeight !== TOTAL_SPLITS_WEIGHT) {
-      throw new Error(
-        `receiver weights must sum to TOTAL_SPLITS_WEIGHT (${TOTAL_SPLITS_WEIGHT}), got ${totalWeight}`
+    const args: xdr.ScVal[] = [
+      nativeToScVal(sender, { type: "address" }),
+      xdr.ScVal.scvVec(
+        receivers.map((r) => nativeToScVal(r, { type: "address" }))
+      ),
+      xdr.ScVal.scvVec(amounts.map((a) => nativeToScVal(a, { type: "i128" }))),
+      nativeToScVal(token, { type: "address" }),
+    ];
+    return this.submitAndSettle(sender, "batch_give", args, signer);
+  }
+
+  /**
+   * Settle all past drips cycles for an account/token pair, transferring
+   * accumulated streaming income into the account's collectable balance.
+   *
+   * Simulates the receivable amount first; if no past cycles are pending the
+   * transaction is **not** submitted and the method resolves with
+   * `{ received: 0n, txHash: "" }` — no gas is spent and no error is thrown.
+   *
+   * @param account - Stellar address whose past cycles to settle.
+   * @param token - Stellar Asset Contract address of the token.
+   * @param signer - Function that signs the transaction XDR.
+   * @param maxCycles - Maximum number of past cycles to process in one call.
+   *   Defaults to 100. Capped to avoid exceeding Soroban instruction limits.
+   * @returns `{ received, txHash }`. When nothing was settled, `txHash` is `""`
+   *   and `received` is `0n`.
+   */
+  async receiveStreams(
+    account: string,
+    token: string,
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>,
+    maxCycles = 100
+  ): Promise<ReceiveStreamsResult> {
+    // Probe receivable amount before spending fees.
+    let receivable = 0n;
+    try {
+      const val = await this.simulate(
+        "receivable_streams",
+        [
+          nativeToScVal(account, { type: "address" }),
+          nativeToScVal(token, { type: "address" }),
+          nativeToScVal(maxCycles, { type: "u32" }),
+        ],
+        account
       );
+      receivable = BigInt(scValToNative(val) ?? 0);
+    } catch {
+      // Contract may not expose `receivable_streams` view — proceed to submit.
+      receivable = 1n; // sentinel: proceed
     }
 
-    const receiversVal = xdr.ScVal.scvVec(
-      receivers.map((r) =>
+    // Nothing to settle — skip the transaction entirely.
+    if (receivable === 0n) {
+      return { received: 0n, txHash: "" };
+    }
+
+    const txHash = await this.buildAndSend(
+      account,
+      "receive_streams",
+      [
+        nativeToScVal(account, { type: "address" }),
+        nativeToScVal(token, { type: "address" }),
+        nativeToScVal(maxCycles, { type: "u32" }),
+      ],
+      signer
+    );
+
+    const received = receivable === 1n ? 0n : receivable;
+    return { received, txHash };
+  }
+
+  /**
+   * Collect the tokens a sender has streamed to `account` so far in the
+   * current, unfinished drips cycle ("squeeze"), instead of waiting for the
+   * cycle to end. Wraps the `squeeze_streams` contract entry point.
+   *
+   * The call is simulated first to learn how much it would collect; when that
+   * is nothing the transaction is **not** submitted and the method resolves
+   * with `{ collected: 0n, txHash: "" }` — no gas is spent.
+   *
+   * @param account - Stellar address of the receiver collecting the tokens
+   *   (must sign the transaction).
+   * @param sender - Stellar address of the stream sender to squeeze from.
+   * @param token - Stellar Asset Contract address of the streamed token.
+   * @param history - The sender's streams history, oldest entry first.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns `{ collected, txHash }`. When nothing was squeezed, `collected`
+   *   is `0n` and `txHash` is `""`.
+   */
+  async squeezeStreams(
+    account: string,
+    sender: string,
+    token: string,
+    history: StreamsHistory[],
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<SqueezeStreamsResult> {
+    // Contract struct fields, in the sorted key order Soroban maps require.
+    const historyVal = xdr.ScVal.scvVec(
+      history.map((entry) =>
         xdr.ScVal.scvMap([
           new xdr.ScMapEntry({
-            key: xdr.ScVal.scvSymbol("receiver"),
-            val: nativeToScVal(r.address, { type: "address" }),
+            key: xdr.ScVal.scvSymbol("max_end"),
+            val: nativeToScVal(entry.maxEnd, { type: "u64" }),
           }),
           new xdr.ScMapEntry({
-            key: xdr.ScVal.scvSymbol("weight_bps"),
-            val: nativeToScVal(r.weightBps, { type: "u32" }),
+            key: xdr.ScVal.scvSymbol("receivers"),
+            val: xdr.ScVal.scvVec(
+              entry.receivers.map((r) =>
+                xdr.ScVal.scvMap([
+                  new xdr.ScMapEntry({
+                    key: xdr.ScVal.scvSymbol("amt_per_sec"),
+                    val: nativeToScVal(r.ratePerSec, { type: "i128" }),
+                  }),
+                  new xdr.ScMapEntry({
+                    key: xdr.ScVal.scvSymbol("receiver"),
+                    val: nativeToScVal(r.receiver, { type: "address" }),
+                  }),
+                ])
+              )
+            ),
+          }),
+          new xdr.ScMapEntry({
+            key: xdr.ScVal.scvSymbol("update_time"),
+            val: nativeToScVal(entry.updateTime, { type: "u64" }),
           }),
         ])
       )
@@ -1419,14 +1718,110 @@ export class VestflowClient {
 
     const args: xdr.ScVal[] = [
       nativeToScVal(account, { type: "address" }),
-      receiversVal,
+      nativeToScVal(sender, { type: "address" }),
+      nativeToScVal(token, { type: "address" }),
+      historyVal,
     ];
-    return this.submitAndSettle(account, "set_splits", args, signer);
+
+    // Simulating the call returns the amount it would collect.
+    const val = await this.simulate("squeeze_streams", args, account);
+    const collected = BigInt(scValToNative(val) ?? 0);
+
+    // Nothing to squeeze — skip the transaction entirely.
+    if (collected === 0n) {
+      return { collected: 0n, txHash: "" };
+    }
+
+    const txHash = await this.buildAndSend(account, "squeeze_streams", args, signer);
+    return { collected, txHash };
+  }
+
+  /**
+   * Add funds to an account's drips balance for a given token so outgoing
+   * streams can continue flowing.
+   *
+   * @param account - Stellar address topping up its own drips balance.
+   * @param token - Stellar Asset Contract address of the token to deposit.
+   * @param amount - Amount to deposit, in the token's base units. Must be > 0n.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns `{ txHash }` on success.
+   * @throws If `amount` is not positive.
+   */
+  async topUp(
+    account: string,
+    token: string,
+    amount: bigint,
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<TopUpResult> {
+    if (amount <= 0n) {
+      throw new Error("amount must be greater than 0");
+    }
+
+    const txHash = await this.buildAndSend(
+      account,
+      "top_up",
+      [
+        nativeToScVal(account, { type: "address" }),
+        nativeToScVal(token, { type: "address" }),
+        nativeToScVal(amount, { type: "i128" }),
+      ],
+      signer
+    );
+
+    return { txHash };
+  }
+
+  /**
+   * Withdraw unused funds from an account's drips balance back to its wallet.
+   *
+   * Simulates the withdrawable amount first; if the balance is zero the
+   * transaction is **not** submitted and the method resolves with
+   * `{ withdrawn: 0n, txHash: "" }`.
+   *
+   * @param account - Stellar address withdrawing from its own drips balance.
+   * @param token - Stellar Asset Contract address of the token to withdraw.
+   * @param signer - Function that signs the transaction XDR.
+   * @returns `{ withdrawn, txHash }`. When nothing was withdrawn, `txHash` is `""`.
+   */
+  async withdraw(
+    account: string,
+    token: string,
+    signer: (xdr: string, opts: { networkPassphrase: string }) => Promise<string | { signedTxXdr: string }>
+  ): Promise<WithdrawResult> {
+    let withdrawable = 0n;
+    try {
+      const val = await this.simulate(
+        "withdrawable",
+        [
+          nativeToScVal(account, { type: "address" }),
+          nativeToScVal(token, { type: "address" }),
+        ],
+        account
+      );
+      withdrawable = BigInt(scValToNative(val) ?? 0);
+    } catch {
+      withdrawable = 1n; // sentinel: proceed
+    }
+
+    if (withdrawable === 0n) {
+      return { withdrawn: 0n, txHash: "" };
+    }
+
+    const txHash = await this.buildAndSend(
+      account,
+      "withdraw",
+      [
+        nativeToScVal(account, { type: "address" }),
+        nativeToScVal(token, { type: "address" }),
+      ],
+      signer
+    );
+
+    const withdrawn = withdrawable === 1n ? 0n : withdrawable;
+    return { withdrawn, txHash };
   }
 
   subscribeToSchedule(
-    id: number,
-    callback: (schedule: ScheduleData, claimable: bigint) => void | Promise<void>,
     options: {
       intervalMs?: number;
       publicKey?: string;
@@ -1465,4 +1860,51 @@ export class VestflowClient {
       },
     };
   }
+
+  /**
+   * Poll `getBalance` on an interval and invoke `callback` with the latest
+   * balance for an account/token pair.
+   *
+   * The first poll fires immediately; subsequent polls run every
+   * `intervalMs` (default 10 000 ms).
+   *
+   * @param account - Stellar address whose balance to watch.
+   * @param token - Stellar Asset Contract address of the token.
+   * @param callback - Receives the latest `BalanceResult` on each poll.
+   * @param intervalMs - Poll interval in milliseconds. Defaults to 10 000.
+   * @returns Teardown function — call it to stop polling.
+   */
+  subscribeToBalance(
+    account: string,
+    token: string,
+    callback: (balance: BalanceResult) => void | Promise<void>,
+    intervalMs: number = 10_000
+  ): () => void {
+    let active = true;
+
+    const poll = async () => {
+      if (!active) return;
+      try {
+        const balance = await this.getBalance(account, token);
+        if (!active) return;
+        try {
+          await callback(balance);
+        } catch {
+          // Swallow callback errors — the caller's UI should not kill the poller.
+        }
+      } catch (err) {
+        console.error(err);
+      }
+    };
+
+    // Fire immediately, then on each interval tick.
+    void poll();
+    const timerId = setInterval(() => void poll(), intervalMs);
+
+    return () => {
+      active = false;
+      clearInterval(timerId);
+    };
+  }
 }
+

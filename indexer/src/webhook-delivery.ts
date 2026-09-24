@@ -432,6 +432,46 @@ export class WebhookDeliveryWorker {
     markRegistrationVerified(registration.id, this.network);
     return { verified: true };
   }
+
+  /**
+   * Sends a signed `webhook.test` event to a registration's endpoint and
+   * reports whether it answered 2xx. Nothing is queued or retried, so a test
+   * never appears in the registration's delivery history.
+   */
+  async sendTestEvent(
+    registration: WebhookRegistration
+  ): Promise<{ success: boolean; status: number | null; error?: string }> {
+    let secret: string;
+    try {
+      await assertDeliverableUrl(registration.endpoint_url);
+      secret = decryptSecret(registration.secret_encrypted, this.key());
+    } catch (error) {
+      return { success: false, status: null, error: errorMessage(error) };
+    }
+
+    const body = JSON.stringify({
+      type: "webhook.test",
+      registration_id: registration.id,
+    });
+
+    try {
+      const response = await this.request(registration.endpoint_url, {
+        "Content-Type": "application/json",
+        "User-Agent": "VestFlow-Webhooks/1.0",
+        "X-VestFlow-Event": "webhook.test",
+        "X-VestFlow-Signature": signPayload(secret, body, this.nowSeconds()),
+      }, body);
+
+      if (response.ok) return { success: true, status: response.status };
+      return {
+        success: false,
+        status: response.status,
+        error: `endpoint responded ${response.status}`,
+      };
+    } catch (error) {
+      return { success: false, status: null, error: errorMessage(error) };
+    }
+  }
 }
 
 function errorMessage(error: unknown): string {

@@ -175,3 +175,25 @@ jobs:
           NETWORK: testnet
           RPC_URL: https://soroban-testnet.stellar.org
         continue-on-error: true
+
+  # ── 8. Streams endpoint load test ─────────────────────────────
+  streams-load-test:
+    name: Streams Load Test (p99 < 50ms)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: indexer/package-lock.json
+
+      - name: Install indexer dependencies
+        run: npm ci
+        working-directory: indexer
+
+      - name: Seed 10k streams and load test GET /streams (500 connections)
+        run: npm run test:streams-load
+        working-directory: indexer
+        continue-on-error: true

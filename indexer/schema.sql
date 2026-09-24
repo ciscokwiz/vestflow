@@ -193,6 +193,11 @@ CREATE INDEX IF NOT EXISTS idx_gives_sender_timestamp
   ON gives (sender, timestamp DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_gives_receiver_timestamp
   ON gives (receiver, timestamp DESC, id DESC);
+-- GET /gives filtered by sender= or receiver= together with token=.
+CREATE INDEX IF NOT EXISTS idx_gives_sender_token_timestamp
+  ON gives (sender, token, timestamp DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_gives_receiver_token_timestamp
+  ON gives (receiver, token, timestamp DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS collected_totals (
   account                  TEXT NOT NULL,
@@ -248,6 +253,34 @@ CREATE TABLE IF NOT EXISTS notification_milestones (
 );
 
 CREATE INDEX IF NOT EXISTS idx_milestone_schedule ON notification_milestones (schedule_id);
+
+-- App notifications — one row per (wallet, indexed event). `id` is a global,
+-- monotonically increasing cursor used by the SSE stream's Last-Event-ID
+-- replay and is the `id:` field of every SSE frame.
+CREATE TABLE IF NOT EXISTS notifications (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  wallet      TEXT    NOT NULL,
+  event_type  TEXT    NOT NULL,  -- VestingStarted | CliffReached | FullyVested | Claimed | Revoked | PausedSchedule | ResumedSchedule
+  schedule_id INTEGER,
+  event_id    TEXT    NOT NULL,  -- Stellar-assigned event id, for idempotent dedup
+  ledger      INTEGER NOT NULL DEFAULT 0,
+  payload     TEXT    NOT NULL,  -- JSON
+  created_at  INTEGER NOT NULL DEFAULT (unixepoch()),
+  UNIQUE (wallet, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_wallet_id ON notifications (wallet, id);
+
+-- Read state, persisted per wallet (survives browser refresh and is tied to
+-- the wallet address, not the session).
+CREATE TABLE IF NOT EXISTS notification_reads (
+  wallet          TEXT    NOT NULL,
+  notification_id INTEGER NOT NULL,
+  read_at         INTEGER NOT NULL DEFAULT (unixepoch()),
+  PRIMARY KEY (wallet, notification_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_notification_reads_wallet ON notification_reads (wallet);
 
 -- Beneficiary index table for O(1) lookup of schedules by recipient address
 -- Mirrors the BeneficiarySchedules(Address) storage in the smart contract
@@ -391,6 +424,19 @@ CREATE TABLE IF NOT EXISTS analytics_watermark (
   network              TEXT PRIMARY KEY,
   last_ledger          INTEGER NOT NULL DEFAULT 0,
   last_materialized_at INTEGER NOT NULL DEFAULT (unixepoch())
+);
+
+-- Hourly per-token summary of active Drips streams, written by the
+-- materialization worker (analytics.ts) for the streaming TVL chart. Hours
+-- the worker did not run in carry the previous hour's values forward.
+-- Mirrors migrations/006_stream_hourly_snapshots.sql.
+CREATE TABLE IF NOT EXISTS stream_hourly_snapshots (
+  token               TEXT    NOT NULL,
+  hour                INTEGER NOT NULL, -- unix seconds at the start of the UTC hour
+  active_stream_count INTEGER NOT NULL DEFAULT 0,
+  total_rate_per_sec  TEXT    NOT NULL DEFAULT '0', -- bigint as string
+  total_balance       TEXT    NOT NULL DEFAULT '0', -- bigint as string
+  PRIMARY KEY (token, hour)
 );
 -- ── Gap Detection and Replay ─────────────────────────────────────────
 -- Tracks ledger ranges that need to be replayed when gaps are detected

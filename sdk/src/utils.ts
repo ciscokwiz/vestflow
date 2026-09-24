@@ -28,6 +28,22 @@ export function xlmToStroops(amountXlm: string): bigint {
   return BigInt(whole) * 10_000_000n + BigInt(fractionPadded);
 }
 
+export function formatCycleDuration(cycleSecs: number): string {
+  if (!Number.isFinite(cycleSecs) || cycleSecs < 0) {
+    throw new Error("cycle duration must be a non-negative finite number");
+  }
+
+  const day = 24 * 60 * 60;
+  const week = 7 * day;
+  if (cycleSecs >= week) {
+    return `${Math.floor(cycleSecs / week)} weeks`;
+  }
+  if (cycleSecs >= day) {
+    return `${Math.floor(cycleSecs / day)} days`;
+  }
+  return `${Math.floor(cycleSecs / (60 * 60))} hours`;
+}
+
 /**
  * Convert a stroop value to a human-readable XLM string.
  *

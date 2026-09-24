@@ -1,6 +1,7 @@
 // Builds valid XDR payloads (via the real @stellar/stellar-sdk XDR types, so
 // the app's own parsers accept them) to stub Soroban RPC + Freighter for the
-// bulk-create e2e test, without touching a live network or a real wallet.
+// bulk-create and squeeze-stream e2e tests, without touching a live network
+// or a real wallet.
 import type { Page, Route } from "@playwright/test";
 import {
   Account,
@@ -10,6 +11,7 @@ import {
   SorobanDataBuilder,
   Transaction,
   TransactionBuilder,
+  nativeToScVal,
   xdr,
 } from "@stellar/stellar-sdk";
 
@@ -62,6 +64,58 @@ function retvalFor(functionName: string, scheduleId: number): xdr.ScVal {
   if (functionName === "balance") return i128ScVal(1_000_000_0000000n); // 1,000,000 XLM — always fundable
   if (functionName === "create_schedule") return u64ScVal(scheduleId);
   return xdr.ScVal.scvVoid();
+}
+
+/** A linear stream (vesting schedule) that the mocked contract views report. */
+export interface MockStream {
+  id: number;
+  grantor: string;
+  beneficiary: string;
+  token: string;
+  ratePerSecond: bigint;
+  startTime: number;
+  duration: number;
+}
+
+/** Amount streamed to the beneficiary by ledger time `now` (unix seconds). */
+function streamedAmount(stream: MockStream, now: number): bigint {
+  const elapsed = Math.min(Math.max(now - stream.startTime, 0), stream.duration);
+  return stream.ratePerSecond * BigInt(elapsed);
+}
+
+function scheduleScVal(stream: MockStream, claimed: bigint): xdr.ScVal {
+  return nativeToScVal({
+    id: BigInt(stream.id),
+    grantor: stream.grantor,
+    beneficiary: stream.beneficiary,
+    token: stream.token,
+    total_amount: stream.ratePerSecond * BigInt(stream.duration),
+    claimed,
+    start_time: BigInt(stream.startTime),
+    duration: BigInt(stream.duration),
+    kind: "Linear",
+  });
+}
+
+/** Answers the dashboard's stream views as of ledger time `now`; null for any other method. */
+function streamRetvalFor(
+  functionName: string,
+  stream: MockStream,
+  now: number,
+  collected: bigint
+): xdr.ScVal | null {
+  switch (functionName) {
+    case "beneficiary_schedule_ids":
+      return xdr.ScVal.scvVec([u64ScVal(stream.id)]);
+    case "get_schedule_batch":
+      return xdr.ScVal.scvVec([scheduleScVal(stream, collected)]);
+    case "claimable_bulk":
+      return xdr.ScVal.scvVec([i128ScVal(streamedAmount(stream, now) - collected)]);
+    case "vested_amount_bulk":
+      return xdr.ScVal.scvVec([i128ScVal(streamedAmount(stream, now))]);
+    default:
+      return null;
+  }
 }
 
 function invokedFunctionName(envelopeXdrBase64: string): string {
@@ -122,6 +176,18 @@ function anyEnvelopeXdr(): string {
 let seq = 0;
 let lastFunctionName = "";
 
+export interface MockRpcOptions {
+  /** Stream the mocked contract views serve to the connected wallet. */
+  stream?: MockStream;
+  /** Ledger time (unix seconds) the mocked contract views start at; defaults to now. */
+  ledgerTime?: number;
+}
+
+export interface MockRpc {
+  /** Moves the mocked ledger clock forward so the stream accrues `seconds` more. */
+  advanceLedgerTime(seconds: number): void;
+}
+
 /**
  * Registers a page.route() handler that stubs the Soroban RPC endpoint the
  * app talks to (getAccount → getLedgerEntries, simulateTransaction,
@@ -129,8 +195,19 @@ let lastFunctionName = "";
  * SUBMIT_TRANSACTION Freighter bridge injected via addInitScript, so
  * "create_schedule" calls succeed against the running dev server without a
  * real wallet extension or real testnet traffic.
+ *
+ * When `options.stream` is given, the dashboard's schedule views report that
+ * stream as of a mocked ledger clock (see `MockRpc.advanceLedgerTime`), and a
+ * submitted "squeeze_streams" collects everything streamed so far.
  */
-export async function mockFreighterAndRpc(page: Page, rpcUrlPattern: string) {
+export async function mockFreighterAndRpc(
+  page: Page,
+  rpcUrlPattern: string,
+  options: MockRpcOptions = {}
+): Promise<MockRpc> {
+  let ledgerTime = options.ledgerTime ?? Math.floor(Date.now() / 1000);
+  let collected = 0n;
+
   await page.addInitScript(
     ({ publicKey }) => {
       (window as unknown as { freighter: boolean }).freighter = true;
@@ -181,16 +258,27 @@ export async function mockFreighterAndRpc(page: Page, rpcUrlPattern: string) {
       case "simulateTransaction": {
         seq++;
         lastFunctionName = params?.transaction ? invokedFunctionName(params.transaction) : "";
+        const streamRetval = options.stream
+          ? streamRetvalFor(lastFunctionName, options.stream, ledgerTime, collected)
+          : null;
+        const retval = streamRetval ?? retvalFor(lastFunctionName, seq);
         return respond({
           latestLedger: 1000,
           minResourceFee: "50000",
           transactionData: emptySorobanTransactionDataXdr("50000"),
-          results: [{ auth: [], xdr: retvalFor(lastFunctionName, seq).toXDR("base64") }],
+          results: [{ auth: [], xdr: retval.toXDR("base64") }],
           cost: { cpuInsns: "0", memBytes: "0" },
           events: [],
         });
       }
       case "sendTransaction": {
+        if (
+          options.stream &&
+          params?.transaction &&
+          invokedFunctionName(params.transaction) === "squeeze_streams"
+        ) {
+          collected = streamedAmount(options.stream, ledgerTime);
+        }
         return respond({
           status: "PENDING",
           hash: seq.toString(16).padStart(64, "0"),
@@ -218,4 +306,10 @@ export async function mockFreighterAndRpc(page: Page, rpcUrlPattern: string) {
         return respond({});
     }
   });
+
+  return {
+    advanceLedgerTime(seconds: number) {
+      ledgerTime += seconds;
+    },
+  };
 }

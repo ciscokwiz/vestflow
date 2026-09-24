@@ -15,29 +15,40 @@
 
 import http from "http";
 import { URL } from "url";
+import { createHash } from "node:crypto";
 import {
   getCheckpoint,
   getDripsStreamingTvl,
+  getDripsStreamsLastUpdated,
   getTvlStats,
   queryDripsListMembers,
   queryDripsLists,
+  queryDripsSplits,
   queryDripsStreams,
   queryEvents,
+  queryGives,
+  queryGivesForAccount,
   queryHistory,
 } from "./db";
-import type { EventQueryParams } from "./types";
+import type { EventQueryParams, GiveQueryParams } from "./types";
 import { routeWebhookRequest } from "./webhook-api";
-import { getTvlSeries, getScheduleHistory, getGrantorSummary } from "./analytics";
+import { routeNotificationsRequest } from "./notifications-api";
+import { startNotificationFanout } from "./sse";
+import {
+  getTvlSeries,
+  getScheduleHistory,
+  getGrantorSummary,
+} from "./analytics";
 import { cacheKey, cacheGet, cacheSet } from "./analytics-cache";
-import { getCachedTokenDecimals, getTokenDecimals, stroopsToDisplay } from "./token-metadata";
+import {
+  getCachedTokenDecimals,
+  getTokenDecimals,
+  stroopsToDisplay,
+} from "./token-metadata";
 
 const PORT = Number(process.env.INDEXER_PORT ?? "3001");
 
-function json(
-  res: http.ServerResponse,
-  status: number,
-  body: unknown
-): void {
+function json(res: http.ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, {
     "Content-Type": "application/json",
     "Access-Control-Allow-Origin": "*",
@@ -47,10 +58,54 @@ function json(
   res.end(JSON.stringify(body));
 }
 
-function numParam(
-  params: URLSearchParams,
-  key: string
-): number | undefined {
+/**
+ * Compute a strong `ETag` for a response. The value is derived from a hash of
+ * the canonical JSON body joined with a caller-supplied last-updated
+ * timestamp, so it is stable across identical payloads and changes the instant
+ * the underlying data changes.
+ */
+function computeEtag(body: unknown, lastUpdated: number): string {
+  const hash = createHash("sha256")
+    .update(String(lastUpdated))
+    .update("\0")
+    .update(JSON.stringify(body));
+  return `"${hash.digest("hex")}"`;
+}
+
+/**
+ * If the caller sent `If-None-Match` equal to the current `ETag`, answer with
+ * 304 Not Modified and no body. Otherwise write a full 200 JSON response with
+ * the fresh `ETag`.
+ */
+function jsonWithEtag(
+  res: http.ServerResponse,
+  body: unknown,
+  lastUpdated: number,
+  ifNoneMatch: string | undefined
+): void {
+  const etag = computeEtag(body, lastUpdated);
+  const headers = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Cache-Control": "public, max-age=30, stale-while-revalidate=120",
+    ETag: etag,
+  };
+
+  if (ifNoneMatch && ifNoneMatch.trim() === etag) {
+    res.writeHead(304, {
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=30, stale-while-revalidate=120",
+      ETag: etag,
+    });
+    res.end();
+    return;
+  }
+
+  res.writeHead(200, headers);
+  res.end(JSON.stringify(body));
+}
+
+function numParam(params: URLSearchParams, key: string): number | undefined {
   const value = params.get(key);
 
   if (value == null) {
@@ -75,53 +130,107 @@ function networkParam(params: URLSearchParams): "mainnet" | "testnet" | null {
 
 const STELLAR_ADDRESS = /^G[A-Z2-7]{55}$/;
 
-function handleLists(res: http.ServerResponse, searchParams: URLSearchParams): void {
+function handleLists(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
   const limit = limitParam(searchParams);
   const network = networkParam(searchParams);
-  if (limit === null) return json(res, 400, { error: "limit must be a positive integer" });
-  if (!network) return json(res, 400, { error: "network must be mainnet or testnet" });
-  const page = queryDripsLists({ owner: searchParams.get("owner") ?? undefined, limit, cursor: searchParams.get("cursor") ?? undefined, network });
+  if (limit === null)
+    return json(res, 400, { error: "limit must be a positive integer" });
+  if (!network)
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  const page = queryDripsLists({
+    owner: searchParams.get("owner") ?? undefined,
+    limit,
+    cursor: searchParams.get("cursor") ?? undefined,
+    network,
+  });
   if (!page) return json(res, 400, { error: "cursor is invalid" });
   return json(res, 200, { lists: page.items, next_cursor: page.nextCursor });
 }
 
-function handleListMembers(res: http.ServerResponse, listId: string, searchParams: URLSearchParams): void {
+function handleListMembers(
+  res: http.ServerResponse,
+  listId: string,
+  searchParams: URLSearchParams,
+): void {
   const limit = limitParam(searchParams);
   const network = networkParam(searchParams);
-  if (limit === null) return json(res, 400, { error: "limit must be a positive integer" });
-  if (!network) return json(res, 400, { error: "network must be mainnet or testnet" });
-  const page = queryDripsListMembers({ listId, limit, cursor: searchParams.get("cursor") ?? undefined, network });
+  if (limit === null)
+    return json(res, 400, { error: "limit must be a positive integer" });
+  if (!network)
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  const page = queryDripsListMembers({
+    listId,
+    limit,
+    cursor: searchParams.get("cursor") ?? undefined,
+    network,
+  });
   if (page === "not_found") return json(res, 404, { error: "List not found" });
   if (!page) return json(res, 400, { error: "cursor is invalid" });
   return json(res, 200, { members: page.items, next_cursor: page.nextCursor });
 }
 
-function handleStreams(res: http.ServerResponse, searchParams: URLSearchParams): void {
+function handleStreams(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+  ifNoneMatch?: string,
+): void {
   const account = searchParams.get("account");
   const limit = limitParam(searchParams);
   const network = networkParam(searchParams);
-  if (!account || !STELLAR_ADDRESS.test(account)) return json(res, 400, { error: "account must be a valid Stellar address" });
-  if (limit === null) return json(res, 400, { error: "limit must be a positive integer" });
-  if (!network) return json(res, 400, { error: "network must be mainnet or testnet" });
-  const page = queryDripsStreams({ account, limit, cursor: searchParams.get("cursor") ?? undefined, network });
+  if (!account || !STELLAR_ADDRESS.test(account))
+    return json(res, 400, { error: "account must be a valid Stellar address" });
+  if (limit === null)
+    return json(res, 400, { error: "limit must be a positive integer" });
+  if (!network)
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  const page = queryDripsStreams({
+    account,
+    limit,
+    cursor: searchParams.get("cursor") ?? undefined,
+    network,
+  });
   if (!page) return json(res, 400, { error: "cursor is invalid" });
-  return json(res, 200, { streams: page.items, next_cursor: page.nextCursor });
+  const body = { streams: page.items, next_cursor: page.nextCursor };
+  const lastUpdated = getDripsStreamsLastUpdated(account, network);
+  return jsonWithEtag(res, body, lastUpdated, ifNoneMatch);
 }
 
-function handleStreamsTvl(res: http.ServerResponse, searchParams: URLSearchParams): void {
+function handleSplits(res: http.ServerResponse, searchParams: URLSearchParams, ifNoneMatch?: string): void {
+  const account = searchParams.get("account");
+  const network = networkParam(searchParams);
+  if (!account || !STELLAR_ADDRESS.test(account)) return json(res, 400, { error: "account must be a valid Stellar address" });
+  if (!network) return json(res, 400, { error: "network must be mainnet or testnet" });
+  const { receivers, hash, last_updated } = queryDripsSplits(account, network);
+  const body = { account, network, receivers, hash };
+  return jsonWithEtag(res, body, last_updated, ifNoneMatch);
+}
+
+function handleStreamsTvl(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
   const token = searchParams.get("token");
   const network = networkParam(searchParams);
   if (!token) return json(res, 400, { error: "token query param is required" });
-  if (!network) return json(res, 400, { error: "network must be mainnet or testnet" });
-  const key = cacheKey(`streams:${network}:${token}`, "current", "current", false);
+  if (!network)
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  const key = cacheKey(
+    `streams:${network}:${token}`,
+    "current",
+    "current",
+    false,
+  );
   const cached = cacheGet<string>(key);
   const total = cached ?? getDripsStreamingTvl(token, network);
   if (!cached) cacheSet(key, total, "current");
-  return json(res, 200, { token, total_value_locked: total, cached: !!cached },);
+  return json(res, 200, { token, total_value_locked: total, cached: !!cached });
 }
 
 function buildEventQueryParams(
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
 ): EventQueryParams {
   return {
     address: searchParams.get("address") ?? undefined,
@@ -145,10 +254,11 @@ function handleHealth(res: http.ServerResponse): void {
 
 function handleTvl(
   res: http.ServerResponse,
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
 ): void {
   try {
-    const network = (searchParams.get("network") ?? "testnet") as "mainnet" | "testnet";
+    const network = (searchParams.get("network") ?? "testnet") as
+      "mainnet" | "testnet";
     if (network !== "mainnet" && network !== "testnet") {
       return json(res, 400, { error: "network must be mainnet or testnet" });
     }
@@ -162,7 +272,7 @@ function handleTvl(
 
 function handleEvents(
   res: http.ServerResponse,
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
 ): void {
   try {
     const events = queryEvents(buildEventQueryParams(searchParams));
@@ -183,7 +293,7 @@ function handleEvents(
 function handleHistory(
   res: http.ServerResponse,
   address: string,
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
 ): void {
   try {
     const limit = numParam(searchParams, "limit");
@@ -215,7 +325,9 @@ function toDay(value: string): string | null {
   return d.toISOString().slice(0, 10);
 }
 
-function defaultRange(searchParams: URLSearchParams): { from: string; to: string } | null {
+function defaultRange(
+  searchParams: URLSearchParams,
+): { from: string; to: string } | null {
   const toRaw = searchParams.get("to");
   const fromRaw = searchParams.get("from");
 
@@ -224,13 +336,18 @@ function defaultRange(searchParams: URLSearchParams): { from: string; to: string
 
   const from = fromRaw
     ? toDay(fromRaw)
-    : new Date(Date.parse(`${to}T00:00:00.000Z`) - 29 * 86_400_000).toISOString().slice(0, 10);
+    : new Date(Date.parse(`${to}T00:00:00.000Z`) - 29 * 86_400_000)
+        .toISOString()
+        .slice(0, 10);
   if (!from) return null;
 
   return { from, to };
 }
 
-function handleAnalyticsTvl(res: http.ServerResponse, searchParams: URLSearchParams): void {
+function handleAnalyticsTvl(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
   try {
     const token = searchParams.get("token");
     if (!token) {
@@ -242,7 +359,8 @@ function handleAnalyticsTvl(res: http.ServerResponse, searchParams: URLSearchPar
       return json(res, 400, { error: "from/to must be valid ISO 8601 dates" });
     }
 
-    const network = (searchParams.get("network") ?? "testnet") as "mainnet" | "testnet";
+    const network = (searchParams.get("network") ?? "testnet") as
+      "mainnet" | "testnet";
     const cumulative = searchParams.get("cumulative") === "true";
     // Warm the decimals cache in the background; never blocks the response
     // (the display conversion below just falls back until it resolves).
@@ -251,12 +369,16 @@ function handleAnalyticsTvl(res: http.ServerResponse, searchParams: URLSearchPar
 
     const key = cacheKey(token, range.from, range.to, cumulative);
     const cached = cacheGet<ReturnType<typeof getTvlSeries>>(key);
-    const points = cached ?? getTvlSeries(token, range.from, range.to, cumulative);
+    const points =
+      cached ?? getTvlSeries(token, range.from, range.to, cumulative);
     if (!cached) cacheSet(key, points, range.to);
 
     const withDisplay = points.map((p) => ({
       ...p,
-      total_locked_display: stroopsToDisplay(BigInt(p.total_locked_stroops), decimals),
+      total_locked_display: stroopsToDisplay(
+        BigInt(p.total_locked_stroops),
+        decimals,
+      ),
     }));
 
     json(res, 200, {
@@ -277,7 +399,7 @@ function handleAnalyticsTvl(res: http.ServerResponse, searchParams: URLSearchPar
 function handleAnalyticsScheduleHistory(
   res: http.ServerResponse,
   scheduleId: number,
-  searchParams: URLSearchParams
+  searchParams: URLSearchParams,
 ): void {
   try {
     const range = defaultRange(searchParams);
@@ -286,14 +408,22 @@ function handleAnalyticsScheduleHistory(
     }
 
     const points = getScheduleHistory(scheduleId, range.from, range.to);
-    json(res, 200, { schedule_id: scheduleId, from: range.from, to: range.to, points });
+    json(res, 200, {
+      schedule_id: scheduleId,
+      from: range.from,
+      to: range.to,
+      points,
+    });
   } catch (error) {
     console.error("[server] Analytics schedule history error:", error);
     json(res, 500, { error: "Failed to compute schedule history" });
   }
 }
 
-function handleAnalyticsGrantorSummary(res: http.ServerResponse, address: string): void {
+function handleAnalyticsGrantorSummary(
+  res: http.ServerResponse,
+  address: string,
+): void {
   try {
     const summary = getGrantorSummary(address);
     json(res, 200, summary);
@@ -303,16 +433,19 @@ function handleAnalyticsGrantorSummary(res: http.ServerResponse, address: string
   }
 }
 
-function handleGives(res: http.ServerResponse, searchParams: URLSearchParams): void {
+function handleGives(
+  res: http.ServerResponse,
+  searchParams: URLSearchParams,
+): void {
   // Validate address-like params (Stellar public keys are 56 chars, uppercase)
   const sender = searchParams.get("sender") ?? undefined;
   const receiver = searchParams.get("receiver") ?? undefined;
   const token = searchParams.get("token") ?? undefined;
 
-  if (sender && !/^[A-Z0-9]{56}$/.test(sender)) {
+  if (sender && !/^G[A-Z2-7]{54,55}$/.test(sender)) {
     return json(res, 400, { error: "Invalid sender address" });
   }
-  if (receiver && !/^[A-Z0-9]{56}$/.test(receiver)) {
+  if (receiver && !/^G[A-Z2-7]{54,55}$/.test(receiver)) {
     return json(res, 400, { error: "Invalid receiver address" });
   }
 
@@ -327,8 +460,13 @@ function handleGives(res: http.ServerResponse, searchParams: URLSearchParams): v
   }
 
   const limitRaw = numParam(searchParams, "limit");
-  if (limitRaw !== undefined && (!Number.isInteger(limitRaw) || limitRaw < 1 || limitRaw > 100)) {
-    return json(res, 400, { error: "limit must be an integer between 1 and 100" });
+  if (
+    limitRaw !== undefined &&
+    (!Number.isInteger(limitRaw) || limitRaw < 1 || limitRaw > 100)
+  ) {
+    return json(res, 400, {
+      error: "limit must be an integer between 1 and 100",
+    });
   }
 
   try {
@@ -345,6 +483,66 @@ function handleGives(res: http.ServerResponse, searchParams: URLSearchParams): v
     return json(res, 200, { gives, count: gives.length });
   } catch (error) {
     console.error("[server] Gives query error:", error);
+    return json(res, 500, { error: "Query failed" });
+  }
+}
+
+/**
+ * GET /profile/:address — aggregate an address's streams, splits, gives and
+ * Drips lists into a single profile payload. Addresses with no activity
+ * resolve to an empty profile (HTTP 200), not 404.
+ */
+function handleProfile(
+  res: http.ServerResponse,
+  address: string,
+  searchParams: URLSearchParams,
+): void {
+  if (!STELLAR_ADDRESS.test(address)) {
+    return json(res, 400, { error: "address must be a valid Stellar address" });
+  }
+  const network = networkParam(searchParams);
+  if (!network) {
+    return json(res, 400, { error: "network must be mainnet or testnet" });
+  }
+
+  try {
+    const streamsPage = queryDripsStreams({ account: address, limit: 100, network });
+    const splits = queryDripsSplits(address, network);
+    const gives = queryGivesForAccount(address, network);
+    const listsPage = queryDripsLists({ owner: address, limit: 100, network });
+
+    const streams = (streamsPage?.items ?? []).map((s) => ({
+      sender: address,
+      receiver: s.receiver,
+      token: s.token,
+      ratePerSec: s.rate_per_second,
+      maxEndTime: s.estimated_end_time ?? 0,
+    }));
+    const receivers = splits.receivers ?? [];
+    const lists = listsPage?.items ?? [];
+
+    const totalGiven = gives.reduce(
+      (acc, g) => acc + (g.sender === address ? BigInt(g.amount_stroops) : 0n),
+      0n,
+    );
+
+    return json(res, 200, {
+      address,
+      network,
+      streams,
+      splits: { receivers, hash: splits.hash ?? "" },
+      gives,
+      dripsLists: lists,
+      totals: {
+        streams: streams.length,
+        splitsReceivers: receivers.length,
+        gives: gives.length,
+        totalGiven: totalGiven.toString(),
+        dripsLists: lists.length,
+      },
+    });
+  } catch (error) {
+    console.error("[server] Profile query error:", error);
     return json(res, 500, { error: "Query failed" });
   }
 }
@@ -381,6 +579,20 @@ export function createServer(): http.Server {
       }
     }
 
+    // In-app notification API + SSE stream (own methods and auth).
+    if (
+      url.pathname === "/events/stream" ||
+      url.pathname === "/notifications" ||
+      url.pathname.startsWith("/notifications/")
+    ) {
+      try {
+        if (await routeNotificationsRequest(req, res, url)) return;
+      } catch (error) {
+        console.error("[server] Notification route error:", error);
+        return json(res, 500, { error: "Notification request failed" });
+      }
+    }
+
     if (req.method !== "GET") {
       return json(res, 405, {
         error: "Method not allowed",
@@ -388,15 +600,16 @@ export function createServer(): http.Server {
     }
 
     const historyMatch = url.pathname.match(
-      /^\/schedules\/([A-Z0-9]{56})\/history$/
+      /^\/schedules\/([A-Z0-9]{56})\/history$/,
     );
     const scheduleAnalyticsMatch = url.pathname.match(
-      /^\/analytics\/schedules\/(\d+)\/history$/
+      /^\/analytics\/schedules\/(\d+)\/history$/,
     );
     const grantorAnalyticsMatch = url.pathname.match(
-      /^\/analytics\/grantors\/([A-Z0-9]{56})\/summary$/
+      /^\/analytics\/grantors\/([A-Z0-9]{56})\/summary$/,
     );
     const listMembersMatch = url.pathname.match(/^\/lists\/([^/]+)\/members$/);
+    const profileMatch = url.pathname.match(/^\/profile\/(G[A-Z2-7]{55})$/);
 
     switch (url.pathname) {
       case "/health":
@@ -420,20 +633,34 @@ export function createServer(): http.Server {
         return handleLists(res, url.searchParams);
 
       case "/streams":
-        return handleStreams(res, url.searchParams);
+        return handleStreams(res, url.searchParams, req.headers["if-none-match"]);
+
+      case "/splits":
+        return handleSplits(res, url.searchParams, req.headers["if-none-match"]);
 
       default:
         if (historyMatch) {
           return handleHistory(res, historyMatch[1], url.searchParams);
         }
         if (scheduleAnalyticsMatch) {
-          return handleAnalyticsScheduleHistory(res, Number(scheduleAnalyticsMatch[1]), url.searchParams);
+          return handleAnalyticsScheduleHistory(
+            res,
+            Number(scheduleAnalyticsMatch[1]),
+            url.searchParams,
+          );
         }
         if (grantorAnalyticsMatch) {
           return handleAnalyticsGrantorSummary(res, grantorAnalyticsMatch[1]);
         }
         if (listMembersMatch) {
-          return handleListMembers(res, decodeURIComponent(listMembersMatch[1]), url.searchParams);
+          return handleListMembers(
+            res,
+            decodeURIComponent(listMembersMatch[1]),
+            url.searchParams,
+          );
+        }
+        if (profileMatch) {
+          return handleProfile(res, profileMatch[1], url.searchParams);
         }
         return json(res, 404, {
           error: "Not found",
@@ -450,12 +677,21 @@ if (typeof require !== "undefined" && require.main === module) {
     console.log(`[server] Indexer query API → http://localhost:${PORT}`);
     console.log("[server]   GET /health");
     console.log(
-      "[server]   GET /events?address=G...&event_type=claimed&limit=50"
+      "[server]   GET /events?address=G...&event_type=claimed&limit=50",
     );
     console.log("[server]   POST /webhooks (Bearer wallet JWT)");
     console.log("[server]   GET  /webhooks/:id/deliveries?status=&limit=");
-    console.log("[server]   GET  /analytics/tvl?token=<address>&from=&to=&cumulative=true");
+    console.log("[server]   GET  /events/stream?wallet=G… (SSE)");
+    console.log("[server]   GET  /notifications?page=&limit=&type=&read=");
+    console.log(
+      "[server]   POST /notifications/read | /notifications/read-all",
+    );
+    console.log(
+      "[server]   GET  /analytics/tvl?token=<address>&from=&to=&cumulative=true",
+    );
     console.log("[server]   GET  /analytics/schedules/:id/history?from=&to=");
     console.log("[server]   GET  /analytics/grantors/:address/summary");
   });
+
+  startNotificationFanout();
 }

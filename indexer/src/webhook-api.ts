@@ -5,6 +5,7 @@
  *
  *   POST   /webhooks                                     register an endpoint
  *   GET    /webhooks                                     list your registrations
+ *   POST   /webhooks/test                                send a test event to a registered endpoint
  *   GET    /webhooks/:id                                 registration detail
  *   POST   /webhooks/:id/verify                          (re)run the handshake
  *   DELETE /webhooks/:id                                 disable a registration
@@ -53,7 +54,7 @@ const DELIVERY_STATUSES: DeliveryStatus[] = [
 
 export interface WebhookApiOptions {
   network?: NetworkName;
-  /** Worker used to run handshakes; defaults to the running poller worker. */
+  /** Worker used to run handshakes and test events; defaults to the running poller worker. */
   worker?: WebhookDeliveryWorker;
 }
 
@@ -303,6 +304,55 @@ async function handleVerify(
   });
 }
 
+async function handleTest(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  owner: string,
+  options: WebhookApiOptions
+): Promise<void> {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    return json(res, 400, {
+      error: error instanceof Error ? error.message : "Invalid JSON body",
+    });
+  }
+
+  if (typeof body !== "object" || body === null) {
+    return json(res, 400, { error: "Body must be a JSON object" });
+  }
+
+  const { url, endpoint_url } = body as Record<string, unknown>;
+  const rawUrl = typeof endpoint_url === "string" ? endpoint_url : url;
+
+  if (typeof rawUrl !== "string" || rawUrl.length === 0) {
+    return json(res, 400, { error: "endpoint_url is required" });
+  }
+
+  // Only a URL the caller has already registered can be targeted, so this
+  // route cannot be used to POST to arbitrary URLs.
+  const matches = listRegistrationsByOwner(owner, options.network).filter(
+    (registration) => registration.endpoint_url === rawUrl
+  );
+  if (matches.length === 0) {
+    return json(res, 404, {
+      error: "endpoint_url does not match a registered webhook",
+    });
+  }
+
+  const registration = matches.find((candidate) => candidate.verified_at != null);
+  if (!registration) {
+    return json(res, 409, {
+      error: "Webhook registration is not verified",
+      hint: `POST /webhooks/${matches[0].id}/verify before sending a test event`,
+    });
+  }
+
+  const result = await verifier(options).sendTestEvent(registration);
+  return json(res, 200, result);
+}
+
 function handleListDeliveries(
   res: http.ServerResponse,
   registration: WebhookRegistration,
@@ -400,6 +450,16 @@ export async function routeWebhookRequest(
       return true;
     }
     json(res, 405, { error: "Method not allowed" });
+    return true;
+  }
+
+  // /webhooks/test — registration ids are UUIDs, so "test" never collides.
+  if (segments.length === 2 && segments[1] === "test") {
+    if (method !== "POST") {
+      json(res, 405, { error: "Method not allowed" });
+      return true;
+    }
+    await handleTest(req, res, owner, options);
     return true;
   }
 

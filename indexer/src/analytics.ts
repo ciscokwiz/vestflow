@@ -15,6 +15,9 @@
  * land out of ledger order — including ones for a day already
  * materialized — self-correct the affected day without touching any other
  * day's snapshot.
+ *
+ * Each run also writes the current hour's per-token summary of active Drips
+ * streams into stream_hourly_snapshots.
  */
 
 import {
@@ -30,12 +33,16 @@ import {
   runInTransaction,
   queryScheduleDailySnapshots,
   queryTokenDailyTvl,
+  getStreamTotalsByToken,
+  getStreamHourlySnapshotBefore,
+  upsertStreamHourlySnapshot,
   type RawScheduleEventRow,
   type ScheduleDailySnapshotRow,
 } from "./db";
 import type { NetworkName } from "./config";
 
 const SECONDS_PER_DAY = 86_400;
+const SECONDS_PER_HOUR = 3_600;
 
 // ── Day bucketing ─────────────────────────────────────────────────────
 
@@ -218,11 +225,14 @@ export interface MaterializeResult {
 }
 
 /**
- * Folds every not-yet-materialized event into the snapshot tables. Safe to
- * call after every processed ledger batch — it's a no-op (besides a cheap
- * SELECT) when there's nothing new.
+ * Folds every not-yet-materialized event into the snapshot tables and
+ * refreshes the current hour's stream snapshot. Safe to call after every
+ * processed ledger batch — apart from the stream snapshot it's a no-op
+ * (besides a cheap SELECT) when there's nothing new.
  */
 export function materialize(network?: NetworkName): MaterializeResult {
+  materializeStreamHourlySnapshots(network);
+
   const pending = getUnmaterializedEvents(network);
   if (pending.length === 0) {
     return { events_processed: 0, schedules_affected: 0, tokens_affected: 0, grantors_affected: 0 };
@@ -321,6 +331,32 @@ function recomputeTokenTvl(tokens: Set<string>, today: string, network?: Network
       network
     );
   }
+}
+
+// ── Hourly stream snapshots ───────────────────────────────────────────
+
+/**
+ * Writes the current UTC hour's per-token stream summary, overwriting it on
+ * later runs in the same hour so the row ends up with that hour's latest
+ * state. Hours since a token's previous row that the worker never ran in
+ * (e.g. while the poller was down) are filled with that previous row's
+ * values, leaving one row per token per hour.
+ */
+function materializeStreamHourlySnapshots(network?: NetworkName): void {
+  const now = Math.floor(Date.now() / 1000);
+  const hour = now - (now % SECONDS_PER_HOUR);
+
+  runInTransaction(() => {
+    for (const totals of getStreamTotalsByToken(now, network)) {
+      const previous = getStreamHourlySnapshotBefore(totals.token, hour, network);
+      if (previous) {
+        for (let gap = previous.hour + SECONDS_PER_HOUR; gap < hour; gap += SECONDS_PER_HOUR) {
+          upsertStreamHourlySnapshot({ ...previous, hour: gap }, network);
+        }
+      }
+      upsertStreamHourlySnapshot({ ...totals, hour }, network);
+    }
+  }, network);
 }
 
 // ── Query helpers backing the /analytics/* endpoints ────────────────────

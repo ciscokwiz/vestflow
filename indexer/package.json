@@ -12,6 +12,7 @@
     "test:drips-api": "ts-node test/drips-api.test.ts",
     "test:drips-events": "ts-node test/drips-events-projection.test.ts",
     "test:webhook-load": "ts-node test/webhook_load_test.ts",
+    "test:streams-load": "ts-node --files scripts/load-test-streams.ts",
     "benchmark:analytics": "ts-node --files scripts/benchmark-analytics.ts",
     "build": "tsc",
     "start": "node dist/poller.js",

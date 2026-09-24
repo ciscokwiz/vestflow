@@ -349,6 +349,7 @@ crashed process are reclaimed after `WEBHOOK_LEASE_SECONDS`.
 |------------------------------------------------------|--------------------------------|
 | `POST /webhooks`                                      | Register an endpoint           |
 | `GET /webhooks`                                       | List your registrations        |
+| `POST /webhooks/test`                                 | Send a test event to a registered endpoint |
 | `GET /webhooks/:id`                                   | Registration detail            |
 | `POST /webhooks/:id/verify`                           | Run the handshake              |
 | `DELETE /webhooks/:id`                                | Disable a registration         |

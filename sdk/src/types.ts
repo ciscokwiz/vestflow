@@ -87,6 +87,53 @@ export interface CollectResult {
 }
 
 /**
+ * Result returned by {@link VestflowClient.receiveStreams}.
+ *
+ * When no past cycles are pending the transaction is not submitted:
+ * `received` is `0n` and `txHash` is an empty string.
+ */
+export interface ReceiveStreamsResult {
+  /** Total tokens settled from past cycles, in stroops. */
+  received: bigint;
+  /** Transaction hash, or an empty string when no cycles were settled. */
+  txHash: string;
+}
+
+/**
+ * Result returned by {@link VestflowClient.squeezeStreams}.
+ *
+ * When nothing can be squeezed the transaction is not submitted:
+ * `collected` is `0n` and `txHash` is an empty string.
+ */
+export interface SqueezeStreamsResult {
+  /** Tokens collected from the current, unfinished cycle, in stroops. */
+  collected: bigint;
+  /** Transaction hash, or an empty string when nothing was squeezed. */
+  txHash: string;
+}
+
+/**
+ * Result returned by {@link VestflowClient.topUp}.
+ */
+export interface TopUpResult {
+  /** Transaction hash. */
+  txHash: string;
+}
+
+/**
+ * Result returned by {@link VestflowClient.withdraw}.
+ *
+ * When there is nothing to withdraw the transaction is not submitted:
+ * `withdrawn` is `0n` and `txHash` is an empty string.
+ */
+export interface WithdrawResult {
+  /** Tokens returned to the sender's wallet, in stroops. */
+  withdrawn: bigint;
+  /** Transaction hash, or an empty string when nothing was withdrawn. */
+  txHash: string;
+}
+
+/**
  * Configuration for the VestflowClient.
  */
 export interface VestflowConfig {
@@ -135,6 +182,31 @@ export interface Stream {
   ratePerSec: bigint;
   /** Unix timestamp (seconds) at which the stream stops. */
   maxEndTime: number;
+}
+
+/**
+ * A receiver in a sender's stream configuration, as recorded in
+ * {@link StreamsHistory}.
+ */
+export interface StreamReceiver {
+  /** Stellar address receiving the streamed tokens. */
+  receiver: string;
+  /** Constant flow rate in stroops (base units) per second. */
+  ratePerSec: bigint;
+}
+
+/**
+ * One entry of a sender's streams history: a receiver configuration and the
+ * window it was in effect for. Passed oldest first to
+ * {@link VestflowClient.squeezeStreams}.
+ */
+export interface StreamsHistory {
+  /** Receivers configured by this entry. */
+  receivers: StreamReceiver[];
+  /** Unix timestamp (seconds) at which this configuration took effect. */
+  updateTime: number;
+  /** Unix timestamp (seconds) at which this configuration's balance runs out. */
+  maxEnd: number;
 }
 
 /**
@@ -187,6 +259,108 @@ export interface SplitsConfig {
   receivers: SplitsReceiver[];
   /** Hash identifying this splits configuration, or "" when unconfigured. */
   hash: string;
+}
+
+/**
+ * A single historical one-time direct payment ("give") involving an address.
+ */
+export interface GiveRecord {
+  /** Unique identifier of the give event. */
+  id: string;
+  /** Stellar address that sent the funds. */
+  sender: string;
+  /** Stellar address that received the funds. */
+  receiver: string;
+  /** Stellar Asset Contract address of the token. */
+  token: string;
+  /** Amount transferred, in the token's base units. */
+  amount: bigint;
+  /** Ledger in which the give was included. */
+  ledger: number;
+  /** Unix timestamp (seconds) of the give. */
+  timestamp: number;
+}
+
+/** A paginated page of give history returned by the indexer. */
+export interface GiveHistoryPage {
+  items: GiveRecord[];
+  nextCursor?: string;
+}
+
+/** Filters accepted by `VestflowClient.getGiveHistory`. */
+export interface GiveHistoryOptions {
+  asSender?: boolean;
+  asReceiver?: boolean;
+  token?: string;
+  limit?: number;
+  cursor?: string;
+}
+
+/**
+ * A Drips list owned by an address, as summarised on a profile.
+ */
+export interface DripsListSummary {
+  /** Unique list identifier. */
+  id: string;
+  /** Human-readable list name. */
+  name: string;
+  /** Stellar address that owns the list. */
+  owner: string;
+  /** Stellar Asset Contract address the list is funded with. */
+  token: string;
+  /** Number of active members. */
+  memberCount: number;
+}
+
+/**
+ * Aggregated activity for a single address, returned by
+ * `VestflowClient.getProfile`.
+ *
+ * Addresses with no on-chain/indexed activity yield empty arrays, an empty
+ * splits config and zeroed totals.
+ */
+export interface ProfileSummary {
+  /** The queried Stellar address. */
+  address: string;
+  /** Network the profile was read from. */
+  network: "testnet" | "mainnet";
+  /** Outgoing streams opened by the address. */
+  streams: Stream[];
+  /** The address's current splits configuration. */
+  splits: SplitsConfig;
+  /** Recent give activity (sent or received) by the address. */
+  gives: GiveRecord[];
+  /** Drips lists owned by the address. */
+  dripsLists: DripsListSummary[];
+  /** Counts and totals — all zero for addresses with no activity. */
+  totals: {
+    /** Number of outgoing streams. */
+    streams: number;
+    /** Number of configured splits receivers. */
+    splitsReceivers: number;
+    /** Number of give records. */
+    gives: number;
+    /** Sum of give amounts sent by this address, in base units. */
+    totalGiven: bigint;
+    /** Number of Drips lists owned. */
+    dripsLists: number;
+  };
+}
+
+/**
+ * Error thrown by `getProfile` for invalid input or unexpected indexer
+ * responses. `status` mirrors the HTTP status the caller should treat it as
+ * (e.g. 400 for an invalid address).
+ */
+export class ProfileError extends Error {
+  /** HTTP-style status code associated with this failure. */
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "ProfileError";
+    this.status = status;
+  }
 }
 
 /**

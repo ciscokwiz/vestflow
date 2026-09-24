@@ -30,22 +30,22 @@ const schedule = await client.getSchedule(1);
 console.log(schedule);
 
 // Get all schedules for a grantor
-const ids = await client.getSchedulesByGrantor("G...");
+const ids: number[] = await client.getSchedulesByGrantor("G...");
 
 // Get claimable amounts for multiple schedules in one call
-const amounts = await client.getClaimableBulk(ids);
+const amounts: bigint[] = await client.getClaimableBulk(ids);
 ```
 
 ## Write Transactions (Browser + Freighter)
 
 ```ts
-import { VestflowClient } from "@vestflow/sdk";
+import { VestflowClient } from "@drips/stellar-sdk";
 import { signTransaction } from "@stellar/freighter-api";
 
 const client = new VestflowClient({ network: "testnet" });
 
 // Create a vesting schedule
-const hash = await client.createSchedule(
+const hash: string = await client.createSchedule(
   {
     grantor: "G...",
     beneficiary: "G...",
@@ -60,46 +60,183 @@ const hash = await client.createSchedule(
 );
 
 // Claim vested tokens
-const claimHash = await client.claimVested("G...", scheduleId, signTransaction);
+const claimHash: string = await client.claimVested(
+  "G...",
+  scheduleId,
+  signTransaction
+);
 
 // Revoke a schedule (grantor only)
-const revokeHash = await client.revokeSchedule("G...", scheduleId, signTransaction);
+const revokeHash: string = await client.revokeSchedule(
+  "G...",
+  scheduleId,
+  signTransaction
+);
 ```
 
 ## Write Transactions (Node.js + Keypair)
 
 ```ts
-import { VestflowClient } from "@vestflow/sdk";
+import { VestflowClient } from "@drips/stellar-sdk";
 import { Keypair, TransactionBuilder } from "@stellar/stellar-sdk";
 
 const client = new VestflowClient({ network: "testnet" });
 const keypair = Keypair.fromSecret("S...");
 
-const nodeSigner = async (xdr: string, opts: { networkPassphrase: string }) => {
+const nodeSigner = async (
+  xdr: string,
+  opts: { networkPassphrase: string }
+): Promise<string> => {
   const tx = TransactionBuilder.fromXDR(xdr, opts.networkPassphrase);
   tx.sign(keypair);
   return tx.toXDR();
 };
 
-const hash = await client.createSchedule({ ... }, nodeSigner);
+const hash: string = await client.createSchedule({ ... }, nodeSigner);
 ```
 
-### Get active outgoing streams
+## Give (One-time Direct Payments)
+
+Send a single or batched one-time payment that bypasses any vesting schedule:
 
 ```ts
-// Query the indexer for all active streams opened by an account.
-const streams = await client.getStreams("G...");
+import { VestflowClient, type TransactionResult } from "@drips/stellar-sdk";
+import { signTransaction } from "@stellar/freighter-api";
+
+const client = new VestflowClient({ network: "testnet" });
+
+// Single give
+const result: TransactionResult = await client.give(
+  "GSENDER...",           // sender (must sign)
+  "GRECEIVER...",         // receiver (account or contract)
+  "CTOKEN...",            // Stellar Asset Contract address
+  1_000_000n,             // amount in stroops (base units)
+  signTransaction
+);
+console.log(result.hash, result.status);
+
+// Batch give — multiple receivers in one transaction
+const batchResult: TransactionResult = await client.batchGive(
+  "GSENDER...",
+  ["GRECEIVER1...", "GRECEIVER2..."],
+  [500_000n, 250_000n],   // one amount per receiver, each > 0
+  "CTOKEN...",
+  signTransaction
+);
+```
+
+`batchGive` validates that `receivers` and `amounts` have the same length and
+that every amount is positive before submitting.
+
+## Streams
+
+Query active outgoing streams, or watch a live balance on an interval:
+
+```ts
+import { VestflowClient, type Stream, type BalanceResult } from "@drips/stellar-sdk";
+
+const client = new VestflowClient({ network: "testnet" });
+
+// Get active outgoing streams for an account
+const streams: Stream[] = await client.getStreams("G...");
 for (const s of streams) {
   console.log(s.receiver, s.token, s.ratePerSec.toString(), s.maxEndTime);
 }
+
+// Poll a live streaming balance (immediate first poll, default every 10s)
+const stop: () => void = client.subscribeToBalance(
+  "GACCOUNT...",
+  "CTOKEN...",
+  (balance: BalanceResult) => {
+    console.log(
+      "streaming:",
+      balance.streamingBalance.toString(),
+      "collectable:",
+      balance.collectableAmount.toString()
+    );
+  },
+  10_000 // optional intervalMs (defaults to 10_000)
+);
+
+// Later — stop polling
+stop();
 ```
 
-### Waiting for a transaction
+## Collect
+
+Claim (collect) vested/streamed tokens:
+
+```ts
+const collectHash: string = await client.collect("G...", scheduleId, signTransaction);
+```
+
+## Splits
+
+Read an account's current splits configuration from the indexer:
+
+```ts
+import { VestflowClient, type SplitsConfig } from "@drips/stellar-sdk";
+
+const client = new VestflowClient({ network: "testnet" });
+
+const splits: SplitsConfig = await client.getSplits("G...");
+for (const r of splits.receivers) {
+  console.log(r.address, r.weightBps); // weight in basis points (out of 10 000)
+}
+// splits.receivers is [] and splits.hash is "" when nothing is configured
+```
+
+## Profiles
+
+Fetch an aggregated activity profile (streams, splits, gives, Drips lists)
+for any address:
+
+```ts
+import { VestflowClient, ProfileError, type ProfileSummary } from "@drips/stellar-sdk";
+
+const client = new VestflowClient({ network: "testnet" });
+
+try {
+  const profile: ProfileSummary = await client.getProfile("G...");
+  console.log(profile.streams.length, profile.totals.totalGiven.toString());
+} catch (err) {
+  if (err instanceof ProfileError && err.status === 400) {
+    console.error("Invalid address:", err.message);
+  } else {
+    throw err;
+  }
+}
+```
+
+Addresses with no activity resolve to an empty/zeroed profile rather than
+throwing.
+
+## Error Handling
+
+Wrap write calls in `try/catch` and use `parseContractError` for
+user-friendly messages:
+
+```ts
+import { VestflowClient, parseContractError } from "@drips/stellar-sdk";
+import { signTransaction } from "@stellar/freighter-api";
+
+const client = new VestflowClient({ network: "testnet" });
+
+try {
+  await client.give("G...", "G...", "C...", 100n, signTransaction);
+} catch (err) {
+  console.error(parseContractError(err));
+}
+```
+
+Validation failures (invalid addresses, non-positive amounts, mismatched
+batch lengths) throw plain `Error`s before any transaction is built.
+
+## Waiting for a transaction
 
 ```ts
 import { waitForTransaction, TimeoutError } from "@drips/stellar-sdk";
 
-// Poll the RPC with exponential backoff until the tx settles.
 try {
   const result = await waitForTransaction(hash, {
     getTransaction: (h) => server.getTransaction(h),
@@ -123,7 +260,7 @@ try {
 | `contractId` | `string` | Deployed testnet ID | Override contract address |
 | `rpcUrl` | `string` | Public endpoint | Override Soroban RPC URL |
 | `nativeToken` | `string` | Testnet XLM SAC | Override native token SAC |
-| `indexerUrl` | `string` | Public indexer | Override the indexer base URL used by `getStreams` |
+| `indexerUrl` | `string` | Public indexer | Override the indexer base URL used by `getStreams`, `getSplits` and `getProfile` |
 
 ### Read Methods
 
@@ -141,6 +278,7 @@ try {
 | `getStreams(account, indexerUrl?)` | `Promise<Stream[]>` | Active outgoing streams for an account |
 | `getBalance(account, token, publicKey?)` | `Promise<BalanceResult>` | Live streaming balance and collectable amount, via simulation |
 | `getSplits(account)` | `Promise<SplitsConfig>` | Current splits configuration for an account, from the indexer |
+| `getProfile(address)` | `Promise<ProfileSummary>` | Aggregated streams/splits/gives/Drips lists profile for an address |
 
 ### Write Methods
 
@@ -150,7 +288,14 @@ try {
 | `claimVested(publicKey, id, signer)` | `Promise<string>` | Claim vested tokens |
 | `revokeSchedule(publicKey, id, signer)` | `Promise<string>` | Revoke a schedule (grantor only) |
 | `give(sender, receiver, token, amount, signer)` | `Promise<TransactionResult>` | Send a one-time direct payment, bypassing any schedule |
-| `setSplits(account, receivers, signer)` | `Promise<TransactionResult>` | Set the splits receivers; `weightBps` values must sum to `TOTAL_SPLITS_WEIGHT` (10 000) |
+| `batchGive(sender, receivers, amounts, token, signer)` | `Promise<TransactionResult>` | Send one-time direct payments to multiple receivers in one transaction |
+
+### Subscriptions
+
+| Method | Returns | Description |
+|---|---|---|
+| `subscribeToBalance(account, token, callback, intervalMs?)` | `() => void` | Poll `getBalance` on an interval (default 10s); fires immediately; returns a teardown function that stops polling |
+| `subscribeToSchedule(id, callback, options?)` | `{ unsubscribe(): void }` | Poll a schedule and its claimable amount on an interval |
 
 ### Transaction polling
 
@@ -170,6 +315,12 @@ try {
 | `formatDate(timestamp)` | Format Unix timestamp as date string |
 | `parseContractError(error)` | Map contract error to user-friendly message |
 | `formatRate(amtPerSec, token, decimals)` | Format a per-second flow rate, e.g. "0.008640 XLM / day" |
+
+### Errors
+
+| Export | Description |
+|---|---|
+| `ProfileError` | Thrown by `getProfile` for invalid addresses (`status: 400`) or unexpected indexer failures; carries an HTTP-style `status` |
 
 ## Building
 
